@@ -16,16 +16,24 @@ This builds on #1127, cited at its branch HEAD `7a1c6e53c` (`ir-1127`, unmerged 
 
 - **`diffGaps` is told about the caution, it does not read the phase.** #1285 gave it an `underFullCourseCaution` parameter, which the translator passes as `state.cautionPhase !== "none"` after `diffCaution` has run. That parameter is used, so the phase still has one derivation.
 - **#1285 already clears the lap history on every caution tick,** and trend calls now read a lap-over-lap rate that needs a lap of same-spot history. What still survived a caution was the callout bookkeeping, and the threshold call, which needs no rate: it fired four times inside one caution on 2026-10-02 (the issue's comment).
-- **The restart lap gets both halves of the opening-lap treatment.** Since #1285 the opening lap is special twice: the grid assumption, and its exclusion from the lap history (so trend calls begin on lap 3). The ruling below gives the restart lap "the opening-lap treatment", so one predicate now carries both. Trend calls therefore resume on the third lap under green (the restart lap is not recorded, the next is, the one after is compared with it), where before this change they resumed on the second.
+- **The restart lap gets two of the opening lap's three treatments.** Since #1285 the opening lap is special three ways: it is kept out of the lap history (so trend calls begin on lap 3), its threshold call is held to the movement gate, and a side with no history is seeded at the assumed 0.7 s grid spacing. The ruling below gives the restart lap "the opening-lap treatment". The first two carry over through one predicate, so trend calls resume on the third lap under green (the restart lap is not recorded, the next is, the one after is compared with it), where before this change they resumed on the second. The seed does not carry over: see *What the review changed*.
 - **The single pending slot is a bounded queue** (#1185): up to four waiting fires per bus, each dropped after its maximum wait (8 s by default). Both checks are still needed, for the reasons restated below.
 
 Three details the implementation settled, none of which the text below decided:
 
-- **The hold runs ahead of the diff's own entry gate.** A caution tick the diff cannot otherwise process (the player out of the car) holds the bookkeeping too.
-- **The restart mark is a point in race distance.** A tow under the caution is followed by the next caution tick, and a tow on the restart lap leaves the mark where it is. It is never cleared within a session, only overwritten by the next caution, since a mark the player has passed does nothing.
+- **The hold runs ahead of the diff's own entry gate,** and clears the lap history there too, so a caution tick that fails that gate is at rest in the same way as one that passes it. The restart mark needs the player's progress and is written below the gate.
+- **The restart mark is a point in race distance.** A tow under the caution is followed by the next caution tick, and a tow on the restart lap leaves the mark where it is. A mark the player has passed does nothing, and the next caution overwrites it. It is dropped when the player is found more than a lap behind where it was written, which a tow cannot do: that is an admin restart of the race under the same `SessionNum`, and a mark from the old race would otherwise silence trend calls for as many laps as that race had run (found by the second read).
 - **The mark is preserved across the replay wipe,** the only gap state that is. The race's opening lap survives a glance at the replay because it is read from telemetry, and the restart lap has to survive it the same way.
 
-One inherited behaviour reaches the restart lap with the grid assumption (#933, not changed here): a crossing the opening-lap movement gate holds back stays armed, so if the neighbour is still inside the threshold when that lap ends, "caught" is said then.
+One inherited behaviour reaches the restart lap with the movement gate (#933, not changed here): a crossing the gate holds back stays armed, so if the neighbour is still inside the threshold when that lap ends, "caught" is said then.
+
+### What the review changed
+
+The branch's code review found three places where the text below was wrong, and the implementation follows the review:
+
+- **The restart lap does not seed a side at the assumed grid spacing.** A grid puts standings neighbours a car length apart by construction; a restart does not, because lapped and other-class cars line up between them. Seeded at 0.7 s, a pair a steady 4 s apart through a caution had its first drift called as "pulling away" 0.6 s off its real trough. On the restart lap a side with no history seeds from its measured gap, as on any ordinary lap. The threshold call loses nothing: an episode only arms above threshold + 0.5 s, so an armed side's measured peak is always above the seed.
+- **`pit-crew.position-change` also asks the caution at speak time.** *Which contracts* below says #1127 gated it fully. It did not: the contract is queueable and checked the caution only when the lap completed, and its readout reads the live order when it speaks, so one queued under green said the caution-shifted position behind the pace car. Its gate now asks the caution in the race branch, ahead of the cooldown claim. `pit-crew.lap-time-best` can wait in the queue the same way and is left ungated on purpose: it reads out the frozen time of a lap run under green, which is late but true.
+- **A race-status fire refused on the caution still has its intro decision taken.** *Two checks* below calls leaving it untaken harmless. It would sit pending, holding that fire's context, until the next position readout, which under a caution can be minutes away.
 
 ## Rulings confirmed
 
@@ -65,7 +73,7 @@ The change covers `pit-crew.gap-trend`, `pit-crew.gap-threshold` and `pit-crew.r
 Considered and left out:
 
 - **The overtake family** is already silent in the translator (see above).
-- **Lap-time and position-change** are fully gated by #1127, both on "caution out now" and on `wasCaution`. This change does not touch them.
+- **Lap-time and position-change** are gated by #1127 when the lap completes, both on "caution out now" and on `wasCaution`. This text first said that was the whole of it and that this change does not touch them; the review found position-change needs the speak-time check too (*What the review changed*).
 - **Pit open/closed, opponent pits, the flag family and fuel** are still useful under a caution. For pit calls, #1127 ruled that explicitly.
 - **Local yellows** are not what the issue is about. Nothing reports the gap calls misbehaving under one, and nothing here changes their handling.
 
@@ -76,7 +84,7 @@ Considered and left out:
 - **In `where:`, the contract refuses while a caution is out.** For the gap calls the check goes in `gapWhereGates`, after the race-finished latch and before the overtake gate and the pure cooldown read. For the race status it goes beside the race-finished latch, together with `data.wasCaution === true`, written the way #1127's lap-time and position-change gates write it. The `where:` check does work the speak-time gate cannot: it keeps a caution-time fire out of the queue. Without it, a threshold call at `NORMAL` weight could take one of the queue's four places, and an arrival over that cap drops the lightest waiting call.
 - **In `speakGate`, the contract refuses while a caution is out.** This is the inverse of the caution family's own gate. The caution check must run before the existing claim, never after it. The gate is the one place a cooldown is claimed (#1137), and a claim followed by a refusal would burn the window for a call nobody heard.
   - The gap gate becomes `admit: (ctx) => !underCaution() && tryClaimGapCallout(ctx.now, cooldownMs())`. `gapSpeakGate` gains the resolver as a second parameter.
-  - The race status gets its own gate: `!underCaution() && positionReadoutSpeakGate.admit(ctx)`. The shared gate itself is untouched, because the two overtake readouts use it too. When the caution check refuses, the shared gate's intro-decision stash is not taken. That is harmless: the stash is keyed to the fire that wrote it and read back only through the matching `ScenarioContext`, so a later fire cannot inherit it.
+  - The race status gets its own gate: `!underCaution() && positionReadoutSpeakGate.admit(ctx)`. The shared gate itself is untouched, because the two overtake readouts use it too. When the caution check refuses, the fire's intro decision is taken and dropped first, as the shared gate does on its own refusals (*What the review changed*).
   - `wasCaution` is not asked at speak time. It is a fact about the completed lap, fixed when the event is emitted, so the `where:` has already answered it.
 - **Both checks are needed, as #1127 found for its own calls.** A `where:` alone lets a pre-throw fire drain into the caution. A `speakGate` alone lets a caution-time fire occupy a place in the queue.
 
@@ -93,7 +101,7 @@ While the phase is not `"none"`:
 - **The traces and the live gaps keep updating.** So Session Info's Gaps display and `getLiveGapBetween` behave exactly as they do today. The display rate chain is left alone too.
 - **Each side's callout bookkeeping is held at its reset value.** That covers the extremes, the contact latch, the breakaway latch, the threshold arming and the stability streak. Step 4 (`maybeEmitCalloutEvents`) does not run, so no `gap.*` event is emitted. `resetSideState` splits into its two halves for this, the rate chain and the callout bookkeeping. It keeps calling both where it does today: a neighbour change and a backwards jump.
 - **The opening-lap treatment extends to the restart.** On every caution tick the diff records the player's progress plus one lap, and the opening-lap predicate holds while the player's progress is below that mark. After the green the mark stops moving, so the treatment covers exactly one lap of running from the restart. It has two halves, and the one predicate carries both:
-  - *The grid assumption.* #933's reasoning carries over unchanged. A double-file restart puts the field nose-to-tail by construction. A neighbour that opens past the re-arm point and closes back is the field sorting itself out, not a catch. Without this, a restart lap could say "We've caught the car ahead" where a start lap never would.
+  - *The threshold call's movement gate.* #933's reasoning carries over. A neighbour that opens past the re-arm point and closes back is the field sorting itself out, not a catch. Without this, a restart lap could say "We've caught the car ahead" where a start lap never would. The gate measures from the pair's real peak since the green, not from an assumed spacing.
   - *No lap history* (#1285). The restart strings the field out as a start does, so a lap compared with the restart lap would call a breakaway or a catch that is only the restart unwinding. The restart lap is not recorded, and trend calls resume on the third lap under green, as they begin on lap 3 of a race.
 
 The bookkeeping is held for the whole caution, rather than reset once at the green, because holding needs no edge detection. The bookkeeping is empty at the green however the phase reached `"none"`: the green edge, the both-bits-clear expiry, or a withdrawn one-to-go. A replay glance that preserves the phase cannot desynchronise it either. The rate chain is not held because it forgets on its own. With α = 0.15 per 0.02-lap checkpoint, a sample's weight falls to about 9% within 0.3 lap. The one-to-go lap is a whole lap of steady formation before the green. What survives a caution is the bookkeeping, not the rate.
@@ -138,7 +146,8 @@ No setting is added. #1127 silenced lap-time and position-change unconditionally
   - No `gap.*` event while the phase is not `"none"`, while `getLiveGaps()` still updates.
   - The case the issue names: a peak recorded before the caution does not produce "gaining" on the first green lap.
   - A breakaway latch and a threshold arming from before the caution do not survive it.
-  - The restart lap applies the grid assumption and records no lap history, and the lap after it does neither.
+  - The restart lap holds the threshold call to the movement gate and records no lap history, and the lap after it does neither.
+  - A pair that never ran nose to tail is not handed a grid-spacing trough on the restart lap.
   - The rate chain is untouched under a caution.
 - `translator.test.ts`: pins `diffGaps` running after `diffCaution`, as #1127 pins its phase readers.
 
