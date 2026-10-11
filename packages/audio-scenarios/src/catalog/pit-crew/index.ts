@@ -909,8 +909,9 @@ export type PitCrewDeps = {
   // Whether a full-course caution is out (issue #1127). Plugins wire
   // `isUnderFullCourseCaution()` from `@iracedeck/sim-events-iracing` — the
   // translator's own caution phase not being "none", never a re-derivation of
-  // the caution bits. Read by the lap-time and position-change contracts,
-  // which fall silent under a caution. Default `() => false` is the truthful
+  // the caution bits. Read by the lap-time, position-change, race-status and
+  // two gap contracts, which fall silent under a caution (the last three since
+  // #1171). Default `() => false` is the truthful
   // answer for a caller that wires no reader.
   getUnderFullCourseCaution?: UnderCautionResolver;
   // WHICH stage the caution is in (issue #1127, second review). Plugins wire
@@ -1684,7 +1685,10 @@ export function registerPitCrew(bus: IEventBus, deps: PitCrewDeps = {}): void {
   engine.defineContract(
     wrapWithMaster(
       wrapCalloutScenario(
-        buildRaceStatusContract(getRaceFinishedFired, getLivePosition),
+        // The caution resolver silences the update while a full-course
+        // caution is out (issue #1171), at event time and again at speak
+        // time: the order is frozen behind the pace car.
+        buildRaceStatusContract(getRaceFinishedFired, getLivePosition, getUnderFullCourseCaution),
         SCENARIO_ID_TO_RACE_STATUS_ID,
         getRaceStatusCalloutEnabled,
         "race-status callout",
@@ -1698,12 +1702,13 @@ export function registerPitCrew(bus: IEventBus, deps: PitCrewDeps = {}): void {
   // reads the event payload; the spoken line and the live gap number are the
   // voice script's `gap.*` vars, read LIVE at speak time. Both contracts
   // share one cooldown: the `where:` runs its pure check, the contract's
-  // `speakGate` claims it (#1137).
+  // `speakGate` claims it (#1137). Both ask the caution resolver in each of
+  // the two, and stay silent while a full-course caution is out (#1171).
   registerGapVocabulary(engine, getLiveGaps);
 
   for (const c of [
-    buildGapTrendContract(getRaceFinishedFired, getOvertakeGate, getGapCooldownMs),
-    buildGapThresholdContract(getRaceFinishedFired, getOvertakeGate, getGapCooldownMs),
+    buildGapTrendContract(getRaceFinishedFired, getOvertakeGate, getGapCooldownMs, getUnderFullCourseCaution),
+    buildGapThresholdContract(getRaceFinishedFired, getOvertakeGate, getGapCooldownMs, getUnderFullCourseCaution),
   ]) {
     engine.defineContract(
       wrapWithMaster(wrapCalloutScenario(c, SCENARIO_ID_TO_GAP_ID, getGapCalloutEnabled, "gap callout", logger)),

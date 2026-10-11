@@ -340,7 +340,7 @@ export type TranslatorState = {
    * driver glanced at the replay cannot survive as a latch into the tick where
    * `diffStartLights` reads it — see `diff/caution.ts`.
    *
-   * Read outside `diffCaution` by exactly two things, both of which stand down
+   * Read ahead of `diffCaution` by three diffs. Two of them stand down
    * for the restart while it is anything but `"none"`: `diffStartLights`
    * suppresses `startLight.start-go.raised`, because a restart carries
    * `StartGo` exactly as a race start does and would otherwise borrow its
@@ -349,7 +349,17 @@ export type TranslatorState = {
    * start bit came with it. Those readers are why the translator must run
    * `diffCaution` AFTER both — the green's rising edge ends the episode on the
    * very tick they judge it, so running it first would leave nothing for
-   * either gate to see.
+   * either gate to see. The third is `diffLaps`, which latches
+   * `lap.completed.wasCaution` from it on every tick (`lapCautionSeen`), and
+   * so reads the phase the PREVIOUS tick settled — one tick late at each
+   * edge.
+   *
+   * `diffGaps` reads it the other way round, and through the translator
+   * rather than from here (issues #1285, #1171): it is handed
+   * `cautionPhase !== "none"` as an argument AFTER `diffCaution` has run, so
+   * what it sees is the phase this tick settled. While that holds it emits no
+   * `gap.*` event and keeps its callout bookkeeping and lap history at rest,
+   * and it marks the lap of running after it (`gapRestartMark`).
    */
   cautionPhase: CautionPhase;
   /**
@@ -1090,7 +1100,8 @@ export type TranslatorState = {
    * sector profile cancels out. Never recorded on lap 1. Cleared (making the
    * next lap silent) on a neighbor identity change, the player's backwards
    * jump, a due checkpoint the side cannot sample, any ETA-regime tick and
-   * every tick under a full-course caution; a plain sampling gap is refused
+   * every tick under a full-course caution or on the lap of running after
+   * one (`gapRestartMark`, issue #1171); a plain sampling gap is refused
    * by the lookup's bracket-contiguity check instead, which also empties the
    * lap-rate window.
    */
@@ -1117,6 +1128,27 @@ export type TranslatorState = {
   /** Player progress at the last recorded checkpoint (−1 before seeding). */
   gapLastCheckpointProgress: number;
   /**
+   * The restart mark (issue #1171): the player's progress plus one lap,
+   * written on every tick a full-course caution is out, so after the green
+   * it stands one lap of running past the restart. While the player's
+   * progress is below it the gap diff treats the lap as it does the race's
+   * opening lap in two respects: no lap history is recorded, and the
+   * threshold call is held to the movement gate. The opening lap's assumed
+   * grid spacing is NOT applied. Written only on a caution tick the diff can
+   * read the player's progress on, so `null` until the session's first such
+   * tick. A mark the player has passed is inert, and the next caution
+   * overwrites it. It is dropped when the player is found more than a lap
+   * behind where it was written: a tow keeps the lap count, so that means the
+   * lap counters were rewound (an admin restart of the race under the same
+   * `SessionNum`), and the mark belongs to a race that is gone.
+   *
+   * PRESERVED across a replay wipe: it is a point in the live race's
+   * distance, and a glance at the replay on the restart lap (or one the
+   * caution ended during) must not turn that lap into ordinary racing — the
+   * opening lap survives the same glance, since it is read from telemetry.
+   */
+  gapRestartMark: number | null;
+  /**
    * Closing-threat announcement latch (issue #933): the laps-to-contact
    * projection at the last `gap.trendChanged` "closing" emission for the
    * side, or null when the episode is armed (nothing announced yet /
@@ -1142,8 +1174,12 @@ export type TranslatorState = {
    * This kills both hover ping-pong and sector-profile fakes ("they're
    * closing" while the gap sits above everything since the last call) with
    * no track-position dependence and no warmup. Reset to the announced gap
-   * on every emission; seeded at the assumed grid spacing on lap 1; null =
-   * no history. Only stable, unsuppressed readings fold in.
+   * on every emission; seeded at the assumed grid spacing on lap 1 only, and
+   * from the measured gap everywhere else, the lap after a full-course
+   * caution included; null = no history. Only stable, unsuppressed readings
+   * fold in. Held at null, with the latches, the stability streak and the
+   * threshold arming around it, on every tick a full-course caution is out
+   * (issue #1171).
    */
   gapMinSinceAnnounceAhead: number | null;
   gapMinSinceAnnounceBehind: number | null;
@@ -1776,6 +1812,7 @@ export function createInitialState(): TranslatorState {
     gapEtaReadingAhead: false,
     gapEtaReadingBehind: false,
     gapLastCheckpointProgress: -1,
+    gapRestartMark: null,
     gapContactAnnouncedLapsAhead: null,
     gapContactAnnouncedLapsBehind: null,
     gapBreakawayAnnouncedAhead: false,

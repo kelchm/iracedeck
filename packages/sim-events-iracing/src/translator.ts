@@ -2048,6 +2048,15 @@ function wipeStateForReplay(self: TranslatorInstance): void {
     lapCautionLatchLap: self.state.lapCautionLatchLap,
     lapCautionSeen: self.state.lapCautionSeen,
     lapCompletedWasCaution: self.state.lapCompletedWasCaution,
+    // The gap diff's restart mark (issue #1171) is the one piece of gap state
+    // kept: it is a point in the live race's distance, one lap past where the
+    // player was when the caution ended, and the lap up to it is kept out of
+    // the lap history and has its threshold call held to the movement gate, as
+    // the opening lap is. The opening lap itself survives a glance because it
+    // is read from telemetry; without this the restart lap would not, and its
+    // strung-out gaps would be recorded and called as ordinary racing. A
+    // caution still out on the way back overwrites it on the first tick.
+    gapRestartMark: self.state.gapRestartMark,
     // The race-end latch and the result it captured (issue #1278): once the
     // driver has taken the checkered flag their race is over, and leaving the
     // car or opening the replay (both replay-mode ticks) must not undo that —
@@ -2649,8 +2658,10 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // `updatePositionTracking` with it (the order is read FROM what that writes),
   // moving a state-mutating call across nine diffs to buy a proximity the
   // comments and the tests already buy. Any diff added between `diffFlags` and
-  // this one must not read or write `cautionPhase`; today only `diffFlags`,
-  // `diffStartLights` and this diff touch it.
+  // this one must not write `cautionPhase`, and one that reads it there reads
+  // the phase the PREVIOUS tick settled; today `diffFlags`, `diffLaps` (the
+  // `wasCaution` latch) and `diffStartLights` read it ahead of this diff, this
+  // diff alone writes it, and `diffGaps` is handed it after this diff has run.
   //
   // It takes no `isRaceSession`, unlike most of its neighbours, and that is
   // deliberate rather than an omission. The #480
@@ -2775,7 +2786,9 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
     gapLapsRemaining,
     self.getGapMinChangeSeconds,
     trackLengthMeters,
-    // `diffCaution` ran earlier this tick, so this is the current phase.
+    // `diffCaution` ran earlier this tick, so this is the current phase —
+    // which is what keeps a gap call off the very tick a caution is thrown
+    // and lets the restart mark stop on the green's own tick (issue #1171).
     self.state.cautionPhase !== "none",
   );
   // Pit-box count-in (issue #600). Reuses the cached `trackLengthMeters` to

@@ -188,6 +188,16 @@ export const POSITION_READOUT_SPEAK_GATE_DESCRIPTION =
   "No other position readout has spoken in the last twenty seconds when this one comes to speak; speaking it starts that window.";
 
 /**
+ * "No other…" → "no other…": how a contract that qualifies the shared gate
+ * sentence composes it onto its own opening — the position call's "In a
+ * race, …", the race status's "No full-course caution is out and …" — so the
+ * window is still described in one string.
+ */
+export function lowerFirst(sentence: string): string {
+  return sentence.charAt(0).toLowerCase() + sentence.slice(1);
+}
+
+/**
  * The supersede group every position readout shares (issue #1185): the
  * lap-completed position call, the race status and the two overtake
  * readouts. They share one cooldown, so only one of them can be said in a
@@ -200,8 +210,9 @@ export const POSITION_READOUT_SUPERSEDE_GROUP = "position";
  * The shared position cooldown as a speak-time gate (issue #1137): the claim
  * every position readout commits after its script expanded and before the ops
  * take the bus. Shared by the two overtake readouts and the race-status
- * readout; `position.ts` carries its own, because its contract also fires in
- * qualifying, where the cooldown is not consulted at all.
+ * readout, which reaches it through a gate of its own that asks the caution
+ * first (issue #1171); `position.ts` carries its own, because its contract
+ * also fires in qualifying, where the cooldown is not consulted at all.
  */
 export const positionReadoutSpeakGate: SpeakGate = {
   description: POSITION_READOUT_SPEAK_GATE_DESCRIPTION,
