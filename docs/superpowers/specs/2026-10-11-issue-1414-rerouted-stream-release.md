@@ -32,7 +32,7 @@ The JS thread never releases a client. A release that has to wait on Windows mus
 
 ### 3. The helper thread no longer depends on a session identity
 
-Since #1411 the helper thread starts when a session identity is first set, because naming was its only job. A process that plays audio without an identity (the scenario harness, a script) would have nobody to release for it. The thread therefore starts with the first engine on WASAPI. `destroyAudioEngine` and the environment cleanup hook still stop and join it, and release whatever is still queued first.
+Since #1411 the helper thread starts when a session identity is first set, because naming was its only job. A process that plays audio without an identity (the scenario harness, a script) would have nobody to release for it. The thread therefore starts when the audio context is created on WASAPI (`initAudioEngine`), which every engine needs first. `destroyAudioEngine` and the environment cleanup hook still stop and join it, and release whatever is still queued first.
 
 A pending rename is cancelled when the engine is torn down. A queued release is not: the abandoned client is independent of the engine and stays abandoned.
 
@@ -67,9 +67,9 @@ The JS side learns nothing new: `Audio device rerouted` (#1330) already records 
 
 No unit test can reach this: it is COM on a live device, and the suite runs against the native mock. The TypeScript side does not change.
 
-- **The measurement that found it, repeated after the fix:** with `powercfg /requests` sampled from an elevated terminal, open the device on a quiet output (the monitor's), switch the default to a Sonar device, release the device and keep the process alive. Before the fix the headset's audio request stays until the process exits (three runs of three). After it, the request is gone within a few seconds of the release. The controls (no switch; monitor to headphones; headphones to monitor) stay clean.
+- **The measurement that found it, repeated after the fix:** with `powercfg /requests` sampled from an elevated terminal, open the device on a quiet output (the monitor's), switch the default to a Sonar device, release the device and keep the process alive. Before the fix the headset's audio request stays until the process exits (three runs of three). After it, the request is gone within a few seconds of the release. The controls (no switch; monitor to headphones; headphones to monitor) stay clean. Measured on 2026-10-11, the two addons back to back: held for the 24 s until the process exited before, gone at the first sample after the release with the fix.
 - **The probe gains the mode this needs:** release the device and stay alive, so the measurement is repeatable from `packages/audio-native/scripts/`.
 - **No new lock-up:** the #1411 probe runs, `--busy 15` and `--busy 15 --cycle 150`, through a hundred or more scripted default changes each, with no stall. The release is a new wait on Windows from the helper thread, and this is the check that it never reaches the JS thread.
-- **Many reroutes, one process:** the process's handle count after a few hundred default changes, measured on the addon before and after. It should grow with the changes before and stay level after; the "before" run is the control and has not been taken yet.
+- **Many reroutes, one process:** the process's handle count across a hundred default changes (404 reroutes) with the device held open, measured on the addon before and after. Measured on 2026-10-11: 274 to 3910 before, about nine handles per reroute, and 274 to 275 with the fix.
 - **In the plugin:** a Settings **Test** sound, a switch of the Windows default to a Sonar device within the 5 s the device stays open, then ten seconds of silence: `powercfg /requests` shows no audio request once nothing else is playing, without restarting the deck host.
 - **On the #1347 branch, rebased over this:** the same with the device held, switching the default several times during a session and checking after iRacing has exited.
