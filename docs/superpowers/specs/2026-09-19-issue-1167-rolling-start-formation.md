@@ -47,7 +47,7 @@ Findings:
 | --- | --- |
 | Pace car moving (`ParadeLaps` entry) | "Pace car's rolling. Inside line, behind car oh seven." |
 | … on pole | "Pace car's rolling. You're on pole — just you and the pace car." |
-| … outside pole | "Pace car's rolling. Front row — nothing ahead but the pace car." |
+| … only the pace car ahead in your line, not leading (the outside pole) | "Pace car's rolling. Nothing ahead of you but the pace car." |
 | … no readable lineup | today's five lines ("…follow the car ahead.") |
 | The car ahead changes during the formation | "Change — you're on the inside behind car twelve." |
 | The pace car begins the last of two pace laps | "One lap to green. Take the inside line behind car oh seven." — on pole "One lap to green. You're leading them away." |
@@ -186,6 +186,18 @@ Five new `rolling-start` entries, one take each: `pace-car-moving-inside-01`, `-
 
 The Pit Crew page's Rolling Start section and callout switch list, the changelog line, `race-positions.md` (the widened carve-out and its consumer entry), a #1167 entry in `race-engineer-callout-examples.md` — its reusable lesson: let the data say which frame of reference it is in, never the caller — the harness `CLAUDE.md`, the rolling-start family in `packages/audio-scenarios/CLAUDE.md`, and the regenerated pack reference.
 
+## Out of scope
+
+Collected from the sections above, so the boundary is in one place:
+
+- **Standing starts.** No pace rows, no `ParadeLaps`, nothing added; the gantry and countdown own them.
+- **A position call at the start.** The race-start brief (#568) speaks the grid slot from the canonical order, and the formation publishes no lineup-place var.
+- **Naming a car from the qualifying grid** where iRacing publishes no pace rows. The numberless line is the answer there.
+- **A lap count for the formation.** A one-lap formation never hears "One lap to green", and nothing announces two.
+- **A catch-up call during the formation.** #1168 judges a gap only in a caution phase.
+- **The partial `car-number` group limitation** of `hasFollowCarNumber`, which is a change to the vocabulary seam.
+- **A player alone on a third line of a double-file field**, which #1127's stray rule does not cover and this issue leaves as it found it.
+
 ## Rejected alternatives
 
 - **A separate formation resolver, or a mode parameter.** Both let a caller pick the offset; see *Why read, not passed*.
@@ -211,6 +223,23 @@ None of these blocks implementation; each is a capture confirming a branch the d
 ## Confirmed by the maintainer
 
 Niklas confirmed five of these decisions on 2026-09-19: "Pace car moving" names the car in one call; a one-lap formation never hears "One lap to green"; the five tyre-warming lines are retired; the one-lap-to-green switch moves to the Rolling start group, relabelled "One lap to green"; and the formation lineup-change call gets its own opt-in, on by default.
+
+## Amended during implementation (2026-10-11)
+
+As the policy allows while the work is unshipped. What was built differently from the text above, and why; the sections above are otherwise left as written.
+
+- **The formation has an identity, not only a boolean.** The translator exposes `getRollingStartFormation()` — `{ id, firstFollowCarIdx }` while a formation runs, `null` otherwise — and `isRollingStartFormation()` is exactly its non-null. #1286, merged after this spec was written, made the caution's lineup-change call speak only when the car ahead is not the one the engineer last named in that caution, because a change queued behind a call that reads the lineup live repeated the car just named. The formation has the same shape — the pace-car call and the one-lap-to-green call both name the car live — so its change call is judged the same way, keyed on the formation's `id`, with the formation's first readable follow car as the reference before anything is named. `PitCrewDeps` therefore gains `getRollingStartFormation` (default `() => null`) rather than `isRollingStartFormation`, and the memory of the car last named is one module both families use.
+- **On the grid the count includes every car that holds a row, in the world or not.** *Who you follow — inherited* carries #1127's in-world count over unchanged, and for the count that was wrong. Under a caution a row holder that is not in the world is a car that has left and keeps its row for a tick; in a formation it is a car that has not arrived and keeps its slot — the capture's own player held L0R5 with surface NotInWorld for 5.67 s — and `race-order.ts` keeps such a car on its qualifying slot, which is the order the `grid` anchor claims to equal. Counting only in-world cars told the outside front car behind an absent pole that he led. The follow-car walk keeps its in-world filter in both frames: you form up behind who is physically there.
+- **The `grid` anchor is narrower than the table.** It also requires a race session, through the predicate `race-order.ts` serves the qualifying grid on, now one shared function; a known pre-green `SessionState` (`Invalid` is a harmless fallback for the running order and a claim on an unknown phase here, so it is refused); and exactly one car at line 0 row 0. Symmetrically, the `pace-car` anchor is refused when another lined-up car shares the pace car's slot — none of the 273 anchored ticks in the three caution fixtures does. `anchor` is `null` whenever `lineupPosition` is.
+- **A thin grid has no position.** With fewer than two cars on a second line the field reads single file by population, and in the `grid` frame the pace car no longer sits on line 0 to mark a lone car on line 1 as a stray, so a two-car formation told both cars they led. In the `grid` frame a single-file reading therefore counts a position only when no lined-up car sits on another line; the car at line 0 row 0 is the pole in either reading and keeps position 1. The lesson for the next frame anyone adds: removing an anchor also removes the protections that leaned on it.
+- **Connecting mid-formation adopts it, silently.** A first tick already in `ParadeLaps` of a rolling start, with the green neither held nor out, opens a formation with no event. Never blurting on connect is about events; this is state, as the caution phase is. The formation's identity survives a replay glance and its baselines do not, so nothing re-fires and a change during the glance is not announced. `diffPaceLaps` still does not arm on a seed (#657), so "One lap to green" is not recovered after a mid-formation restart.
+- **The "front row" line does not say "front row".** That branch plays for a driver with only the pace car ahead in his own line who is not the leader: the outside pole, but also a pole-sitter whose position is withheld. Nothing in it establishes the front row, so it says "Pace car's rolling. Nothing ahead of you but the pace car."
+- **The one-lap-to-green switch moved family in the registry.** A settings-window group is a list of whole callout families, so the row could not be shown under Rolling start while its entry stayed in the flag family. The entry moved to the rolling-start family with its key, default and callout id unchanged; the contract keeps its scenario id and its scheduling `family: "flag"`. The frozen callout baseline took one deliberate edit, that row's `owner`.
+- **The formation calls may wait 20 s** for a busy bus, the caution's value, on the rule (#1185) that a line re-checked at speak time may wait longer than the default.
+- **Where things live now.** `minPluginVersion` is set in `audio-assets/src/build/voice-packs.mjs` and checked by `@iracedeck/voice-packs`; the readers are wired once, in `@iracedeck/race-engineer-wiring`, rather than in three `plugin.ts` files. The second first-party pack, published since, gets the same entries in its own wording; both packs take a minor version and `minPluginVersion` 3.6.0.
+- **One measurement added.** `CarLeftRight` reads clear in all six pace snapshots, formation and caution, double file included (2026-09-17, -18, -19 and 2026-10-02), so the spotter holds no focus floor while the field paces side by side and the calls weighted below it are not held back there.
+
+Still unverified, beyond the four captures listed above: whether a driver who has not gridded still holds his pace row at the `ParadeLaps` entry (the count rule above is right either way; only the reason it matters is uncaptured).
 
 ## Order of work, and review
 
