@@ -233,6 +233,18 @@ Readings:
 
 None of these block implementation: every constant has a provisional value inside the bounds the snapshots already fix.
 
+## Out of scope
+
+Collected from the sections above, so the boundary is in one place:
+
+- **A catch-up call during a rolling-start formation.** Catch-up is live only in a caution phase.
+- **The calls for a wave-around, a free pass or an end-of-line.** Here those procedures only suppress catch-up; announcing them is #1169, which reads the `wavingAround` answer this issue exposes and does not use.
+- **The leader catching the pace car** (#1170), which speaks only while the caution waves and shares only `forwardGapMeters`.
+- **Matching iRacing's own catch-up message.** The engineer's threshold is its own model, clamped to stay near the sim's.
+- **A call when the gap closes.** The episode ends silently.
+- **A "let it by" call** for a driver ahead of his slot. Catch-up stays silent there and says nothing else.
+- **The partial `car-number` group limitation** of `caution.hasFollowCarNumber`, which belongs to that vocabulary.
+
 ## Rejected alternatives
 
 - **Absolute metres.** They encode one track's and one car's pacing. The ratio makes the same decision without knowing which unit iRacing paces by.
@@ -245,6 +257,32 @@ None of these block implementation: every constant has a provisional value insid
 - **Stopping at one to green.** That is the lap it matters most.
 - **One event with an occurrence counter.** A condition reading the event payload, one opt-in for two behaviours, and a repeat dressed as a transition (#951).
 - **A script condition read at speak time as the whole mechanism.** Nothing would trigger it.
+
+## Amended during implementation (2026-10-11)
+
+As the policy allows while the work is unshipped. What was built differently from the text above, or decided where it was silent; the sections above are otherwise left as written.
+
+- **Names.** #1167, implemented on the same branch, renamed the reader: `resolvePaceLineup` / `getPaceLineup()` / `PaceLineup` in `diff/pace-lineup.ts`. Where this spec says `resolveCautionLineup`, `getCautionLineup()` or `CautionLineup`, read those. The plugins are wired once, in `@iracedeck/race-engineer-wiring`, rather than in three `plugin.ts` files. `forwardGapMeters` and the `diffCaution` options object were introduced here; #1170 consumes them.
+- **A due reminder re-anchors whether or not it speaks.** The spec compares the gap "since the previous call". Read literally, a driver who closes one pack spacing and then stalls at 2.9× is never reminded again, because every later comparison is against a call that is now far in the past. So each due time is the new reference: the gap is compared with what it was at the previous due time, a reminder that is skipped because the driver was closing does not count towards the two, and the next due time is scheduled from this one.
+- **Pit exit is strictly one call**, even if the car ahead changes on the way round. The spec's "restarts from zero when the car ahead in your line changes" would otherwise hand a driver catching the field on purpose a fresh call at every car he comes up behind.
+- **A tick that cannot be judged is held, not ended.** A lineup that is unreadable for a tick with the caution still caught, or a tick with no measurable ratio, leaves the episode as it was. Ending there would turn a one-tick dropout into a second first call a dwell later.
+- **The settle clock starts on any entry into `caught`**, including a caution already static when the plugin starts, and its stamp is preserved across the replay wipe beside `cautionProcedureJoined`. The rest of the episode is re-derived, as specified.
+- **The reader has one block the diff never meets.** `getCautionGap()` builds on the memoised `getPaceLineup()`, which resolves a lineup under a yellow-checkered green where `diffLineup` does not, so the reader refuses a `Green` bit itself. "Live" is one function, `resolveCatchUpBlocks`, called by both the diff and the reader, and `getCautionGap()` reports which conditions block it (`blockedBy`) and the measurement beside `warranted` and `wavingAround`, for the Telemetry Snapshot.
+- **`CATCH_UP_PIT_EXIT_GRACE_MS` is not set by C1**: C1 as specified has no pit stop. It stays at 10 s until a capture that leaves pit road under caution exists.
+- **Both calls record the car they name** in #1286's memory of the car last named, so a lineup flicker back to a car the driver was just told to catch is not announced as a change. The lineup-change call does not wait behind a catch-up call: it is heavier and speaks first, and held behind one it would be refused, leaving the driver told to catch a car nobody said he now follows.
+- **The first call may wait 20 s** for a busy bus, the caution family's value (#1185); the reminder keeps the default.
+- **A second track, measured.** Four snapshots from 2026-10-02 (a 1,570.7 m oval, 20 cars) are committed as `__fixtures__/caution-gap-20261002.json`. The figures in the issue's comment left the player's own pair in the pack-spacing pool; excluded, as *What was measured* specifies and as the Homestead table needs in order to reproduce, they read:
+
+  | Snapshot | Gap | Pack spacing (n) | Ratio | Reads |
+  | --- | --- | --- | --- | --- |
+  | `214148` | 10.95 m | 10.18 m (18) | 1.08× | closed |
+  | `214154` | 49.29 m | 10.10 m (18) | 4.88× | open |
+  | `214207` | 93.58 m | 12.69 m (17) | 7.37× | the one-to-go re-form |
+  | `214216` | 20.35 m | 10.68 m (17) | 1.91× | between clear and raise |
+
+  The formed pack's spacing matches Homestead's, so the multiples carry over. `214207` and `214216` are 8.6 s apart, longer than the 3 s dwell, so a driver already lagging before a double-file re-form can hear a first call for his new car ahead during it; whether the dwell should swallow that is C1's reading, and 3 s stands until then.
+- **One measurement added.** `CarLeftRight` reads clear in every pace snapshot, double file included, so the spotter holds no focus floor while the field paces side by side and neither call is held back by it there.
+- **The second first-party pack**, published since, gets the same nine clips; both packs take a minor version and `minPluginVersion` 3.6.0.
 
 ## Order of work, and review
 
