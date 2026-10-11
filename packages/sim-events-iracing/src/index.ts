@@ -16,6 +16,7 @@ export {
   getCautionPhase,
   getDriverSetupName,
   getFuelStats,
+  getLastStopTireTemps,
   getLatestTelemetry,
   getLiveCarPosition,
   getLiveGapBetween,
@@ -83,6 +84,10 @@ export { type CautionLineup, resolveCautionLineup, resolvePlayerCarIdx } from ".
 // the episode `getCautionEpisode()` returns (issue #1286), which scopes a
 // callout's memory to one caution.
 export { type CautionEpisode, type CautionPhase, type RaceFinishResult } from "./state.js";
+// The reading `getLastStopTireTemps()` returns (issue #254): the tire
+// temperatures from the last time the car came in from a run — a pit stop, a
+// tow or reset, or leaving the car — never live ones.
+export { type LastStopTireTemps, type TireCornerTemps } from "./state.js";
 // The damage edge's debounce, the grace a settled edge waits for the crash's
 // incident burst (#1211), and the repair bits it watches — for the harness,
 // whose damage shortcuts replay the translator's timing and bits rather than

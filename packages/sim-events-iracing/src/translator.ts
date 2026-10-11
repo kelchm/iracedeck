@@ -91,7 +91,9 @@ import { updatePositionTracking } from "./diff/race-finish.js";
 import { diffRadar, resolveRadarState } from "./diff/radar.js";
 import { diffReplayLaps } from "./diff/replay-laps.js";
 import { diffRollingStart } from "./diff/rolling-start.js";
+import { updateStallVisit } from "./diff/stall-visit.js";
 import { diffStartCountdown, diffStartLights } from "./diff/start-lights.js";
+import { diffTireTemps, readTireTempsLeavingCar } from "./diff/tire-temps.js";
 import { diffTireWear } from "./diff/tire-wear.js";
 import { diffToggles } from "./diff/toggles.js";
 import { diffTrackWetness, resolveReportedTrackWetness } from "./diff/track-wetness.js";
@@ -104,6 +106,7 @@ import {
   type CautionPhase,
   createInitialState,
   type GapNeighborState,
+  type LastStopTireTemps,
   type RaceFinishResult,
   type TranslatorState,
 } from "./state.js";
@@ -404,6 +407,30 @@ export function getFuelStats(windowLaps: number): FuelStats {
   if (!instance) return { lastLap: null, avg: null, avgLapTime: null, samples: 0 };
 
   return computeFuelStats(instance.fuelLaps.history, windowLaps);
+}
+
+/**
+ * The tire carcass temperatures from the last time the car came in from a run
+ * (issue #254), per corner and tread zone, in °C and unrounded — callers
+ * handle `DisplayUnits` and rounding. `null` when the translator isn't
+ * initialized or no reading has been taken: before the first one, and after
+ * connecting mid-session until the next, because nothing proves the values
+ * iRacing is holding were one.
+ *
+ * NOT a live temperature. iRacing refreshes these values only as the car comes
+ * in — at a pit stop, at a tow or reset to the pits, and when the driver
+ * leaves the car — so the reading describes the run that ended there: after a
+ * tire change, the set that came off. Each is read once, on the tick that
+ * finds the values refreshed, and only after a run on the circuit. A garage
+ * "Drive" placement leaves it as it was (`diffTireTemps`).
+ *
+ * Like the fuel history it survives replay/garage visits and session changes,
+ * so a practice stop's temperatures stay readable while the driver tunes the
+ * setup in the garage. A disconnect clears it, and so does a saved replay,
+ * which never takes one.
+ */
+export function getLastStopTireTemps(): LastStopTireTemps | null {
+  return instance?.state.lastStopTireTemps ?? null;
 }
 
 /**
@@ -1655,7 +1682,9 @@ function handleDisconnect(self: TranslatorInstance): void {
     publishActiveStateTeardown(self, self.latestTelemetry);
   }
 
-  // Fresh state so reconnect seeds cleanly.
+  // Fresh state so reconnect seeds cleanly. This is also where the last stop's
+  // tire temperatures end (issue #254): they outlive a replay visit and a
+  // session change, but not the sim going away.
   self.state = createInitialState();
   self.latestTelemetry = null;
   self.pitSpeedLimitMps = 0;
@@ -1689,7 +1718,8 @@ function handleDisconnect(self: TranslatorInstance): void {
  * would re-seed its ceiling lower and drop a mark at the flip boundary. The
  * flag seed deliberately leaves these fields alone. A genuine session change
  * still clears them (`resetPerSessionState` wipes without preservation), so
- * neither cluster can leak into the next session.
+ * neither cluster can leak into the next session — with one exception, the
+ * last stop's tire temperatures (issue #254), which that wipe carries over too.
  */
 function wipeStateForReplay(self: TranslatorInstance): void {
   const preservedAcrossReplay = {
@@ -1801,6 +1831,15 @@ function wipeStateForReplay(self: TranslatorInstance): void {
     // re-armed `race.finished`. Both still clear on a real session change.
     raceFinishedFired: self.state.raceFinishedFired,
     raceFinish: self.state.raceFinish,
+    // The last stop's tire temperatures (issue #254): a garage visit is
+    // replay-mode ticks, and the garage is exactly where the reading is wanted
+    // — a driver tuning pressures and camber against the run just driven. The
+    // run a reading is taken from (`tireTempsOnCircuit`) is pointedly NOT
+    // preserved: leaving the car ends it, which is what makes the "Drive"
+    // placement after the garage leave this reading alone. A saved replay is
+    // the one replay that must not keep it; the guard in `handleTick` clears
+    // it there.
+    lastStopTireTemps: self.state.lastStopTireTemps,
     // The replay lap record's baselines (issue #1203, `replayLaps*`) are
     // pointedly NOT preserved: they are previous-tick counters a replay view
     // makes meaningless, and the pre-guard diff re-seeds them from the first
@@ -1837,6 +1876,18 @@ function wipeStateForReplay(self: TranslatorInstance): void {
  * seeding would silently mark fired = true if the driver is already on track
  * at the transition and swallow the very fire we want.
  *
+ * The last stop's tire temperatures (`lastStopTireTemps`, issue #254) are
+ * carried over as well — the one reading here that is not per-session: a
+ * practice stop's temperatures are what a driver sets the car up from before
+ * qualifying. The next reading replaces them, and a disconnect clears them.
+ * The run a reading is taken from (`tireTempsOnCircuit`) rides along: a
+ * session that ends with the car on track takes the driver out of it on the
+ * very tick `SessionNum` changes, or soon after, and the leaving-the-car read
+ * further down `handleTick` needs the run to still be there. The sim does not
+ * swap the values for a fresh set's at a session change — the 2026-10-11 tow
+ * capture starts its race on the values the previous session left — so what
+ * that read finds is the run's own refresh, or nothing.
+ *
  * Track-level instance fields (`pitSpeedLimitMps` / `pitSpeedLimitKey`) self-
  * invalidate via `resolvePitSpeedLimit`'s `${TrackID}|${SessionNum}` cache key
  * and need no reset here.
@@ -1850,9 +1901,13 @@ function resetPerSessionState(self: TranslatorInstance, telemetry: TelemetryData
     lastEngineRunning: self.state.lastEngineRunning,
     lastLap: self.state.lastLap,
   };
+  const preservedAcrossSessions = {
+    lastStopTireTemps: self.state.lastStopTireTemps,
+    tireTempsOnCircuit: self.state.tireTempsOnCircuit,
+  };
 
   self.state = createInitialState();
-  Object.assign(self.state, preservedLifecycle);
+  Object.assign(self.state, preservedLifecycle, preservedAcrossSessions);
 
   self.firstOnTrackFired = false;
 
@@ -1931,7 +1986,8 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // read it; the `session.changed` paths and `diffStartCountdown` deliberately
   // do not gate on the replay view at all (#568, #829) and read only the
   // `SimMode` discriminator, as before.
-  const inReplay = self.controller.getReplayState().inReplay;
+  const replayState = self.controller.getReplayState();
+  const inReplay = replayState.inReplay;
 
   // Issue #908: a non-replay-only tick ends the replay episode for the skip
   // log in the fresh-connect gate below, so a later replay episode logs
@@ -2121,6 +2177,17 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // missed. Must run before the replay guard's early return below.
   diffFirstOnTrack(self, telemetry, inReplay);
 
+  // The tire temperatures a run ends with (issue #254): iRacing refreshes them
+  // on the very tick the driver leaves the car, and that tick is the first one
+  // the guard below swallows — the garage is replay-mode ticks. So the reading
+  // is taken here, on the guard's entry tick, while the values the car held on
+  // the circuit are still in `state` to compare against; the entry wipe below
+  // then drops them, which ends the run. Never in a saved replay, where the
+  // guard clears the reading instead.
+  if (inReplay && !self.lastTickInReplay && !replayState.replayOnlySession) {
+    readTireTempsLeavingCar(self.state, telemetry);
+  }
+
   // Suppress every semantic event while a replay is on screen. The
   // engineer voice should be quiet whenever the user isn't actively in
   // the car — replay scrubbing fires phantom flag transitions and pit
@@ -2148,6 +2215,16 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
       // resume — a garage visit moves the car, fuel, and lap counter — so the
       // open segment must re-anchor as partial on the first tick back.
       self.fuelLaps.resumePartial = true;
+    }
+
+    // A saved replay is not a garage visit (issue #254): the last stop's tire
+    // temperatures ride through the wipe above for the driver who steps out
+    // of the car, but nothing a saved replay shows is the driver's own stop,
+    // so there the reading is dropped — on every tick, not only the entry
+    // edge, so a replay loaded while the guard already held clears it too.
+    // None is ever taken there: no saved-replay tick gets past this return.
+    if (replayState.replayOnlySession) {
+      self.state.lastStopTireTemps = null;
     }
 
     return;
@@ -2278,11 +2355,21 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // `tireService.compoundChanged`) in `pending` — those signal user intent
   // and trigger an `entry-refire` readback.
   diffPitReadback(self.state, telemetry, now, emit, pending);
+  // How the car reached its stall (issues #1108, #254): a drive-in or a
+  // placement. Resolved ONCE per tick, from `diffPitLane`'s edges in `pending`,
+  // and handed to the diff that asks whether a stall visit is a pit stop.
+  const stallVisit = updateStallVisit(self.state, telemetry, pending);
   // The tire wear of a stop (issue #1108) rides the exit readback: it reads the
-  // pit-lane edges and the exit `pitService.readbackRequested` out of `pending`,
-  // so it must run immediately after `diffPitReadback` — pushed after it, the
-  // report is always flushed behind the readback of the same tick.
-  diffTireWear(self.state, telemetry, emit, pending);
+  // stall visit above and the exit `pitService.readbackRequested` out of
+  // `pending`, so it must run immediately after `diffPitReadback` — pushed
+  // after it, the report is always flushed behind the readback of the same tick.
+  diffTireWear(self.state, telemetry, emit, pending, stallVisit);
+  // The tire temperatures of the last stop (issue #254) — tracker-only, no
+  // events: it reads the values once, on the tick it finds them refreshed with
+  // the car standing in its box after a run — a stop, a tow or a reset alike,
+  // so it does not ask the stall visit which. Leaving the car is read ahead of
+  // the replay guard above. Read via `getLastStopTireTemps()`.
+  diffTireTemps(self.state, telemetry);
   // The discipline-resolved collision-car value (Sporting Code §3.5.1:
   // 4x pavement / 2x dirt) feeds the spoken incident value (#938).
   diffIncidents(self.state, telemetry, now, emit, resolveCollisionCarValue(sessionInfo), self.logger);

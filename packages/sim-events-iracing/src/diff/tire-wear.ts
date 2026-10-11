@@ -19,50 +19,29 @@
  * (this module runs right after `diffPitReadback`, so `diffPitLane`'s edges and
  * the readback's exit request of the same tick are already in it):
  *
- *   1. `tireWearDroveOnCircuit` — set on a tick the car is driving on the
- *      circuit, cleared when the driver is out of the car or the car is out of
- *      the world, untouched on pit road so it survives the drive down the lane.
- *   2. `pitLane.entered` — clears the flag when the car arrived on pit road
- *      already in its box: a tow or a teleport, never a drive-in. It does NOT
- *      drop a stored report: a re-entry that skips the approach zone (an
- *      `OnPitRoad` flicker at the pit-exit blend line) leaves the readback's
- *      exit fire armed, and it re-arms on the next on→off edge and plays.
- *   3. `pitLane.approaching` — drops a report still waiting, because this is
+ *   1. `pitLane.approaching` — drops a report still waiting, because this is
  *      the one event on which `diffPitReadback` cancels its exit fire; a report
  *      with no fire left to follow must not ride out on a later drive-through.
- *   4. `pitStall.entered` — latches whether this stall visit is a drive-in.
- *   5. `pitStall.departed` — reads the report, only for a drive-in visit.
- *   6. `pitService.readbackRequested { reason: "exit" }` — publishes it.
+ *      `pitLane.entered` does NOT drop one: a re-entry that skips the approach
+ *      zone (an `OnPitRoad` flicker at the pit-exit blend line) leaves the
+ *      readback's exit fire armed, and it re-arms on the next on→off edge and
+ *      plays.
+ *   2. `pitStall.departed` — reads the report, only for a drive-in visit.
+ *   3. `pitService.readbackRequested { reason: "exit" }` — publishes it.
  *
- * A garage start ("Drive") and a tow into the stall both reach the box from a
- * not-on-track / not-in-world state, so neither is a stop and neither reports
- * (maintainer ruling on #1108).
+ * Whether a stall visit is a drive-in is the shared stall-visit rule's answer
+ * (`diff/stall-visit.ts`, hoisted out of this module by #254): a garage start
+ * ("Drive") and a tow into the stall both reach the box from a not-on-track /
+ * not-in-world state, so neither is a stop and neither reports (maintainer
+ * ruling on #1108).
  */
 import type { TireCorner, TireCornerWear, TireWearReport, TireZone } from "@iracedeck/event-bus";
-import { type TelemetryData, TrkLoc } from "@iracedeck/iracing-sdk";
+import type { TelemetryData } from "@iracedeck/iracing-sdk";
 
 import type { TranslatorState } from "../state.js";
+import type { StallVisit } from "./stall-visit.js";
+import { readTireZoneValues, TIRE_CORNERS, zonesFromCarSides } from "./tire-zones.js";
 import type { EmitFn, PendingEvent } from "./types.js";
-
-type WearField = keyof TelemetryData & `${"LF" | "RF" | "LR" | "RR"}wear${"L" | "M" | "R"}`;
-
-type CornerSource = {
-  corner: TireCorner;
-  /** iRacing's L / M / R are the car's left / middle / right. */
-  left: WearField;
-  middle: WearField;
-  right: WearField;
-  /** Which side of the car the tire sits on — decides which shoulder is the inside. */
-  side: "left" | "right";
-};
-
-/** In the tie-break order of the contract: lf, rf, lr, rr. */
-const CORNERS: readonly CornerSource[] = [
-  { corner: "lf", left: "LFwearL", middle: "LFwearM", right: "LFwearR", side: "left" },
-  { corner: "rf", left: "RFwearL", middle: "RFwearM", right: "RFwearR", side: "right" },
-  { corner: "lr", left: "LRwearL", middle: "LRwearM", right: "LRwearR", side: "left" },
-  { corner: "rr", left: "RRwearL", middle: "RRwearM", right: "RRwearR", side: "right" },
-];
 
 /** In the tie-break order of the contract: inside, middle, outside. */
 const ZONES: readonly TireZone[] = ["inside", "middle", "outside"];
@@ -72,38 +51,27 @@ const ZONES: readonly TireZone[] = ["inside", "middle", "outside"];
  * nothing trustworthy to report: any reading missing or non-finite, or all
  * twelve zero (a car with no wear model).
  *
- * The zones are named from the car's centreline: on the left-side tires the
- * sim's L is the outside shoulder and R the inside; on the right-side tires it
- * is the other way round. The capture confirms it — both fronts wear lowest on
- * the inside, the negative-camber signature.
+ * The zones are named from the car's centreline (`zonesFromCarSides`): on the
+ * left-side tires the sim's L is the outside shoulder and R the inside; on the
+ * right-side tires it is the other way round. The capture confirms it — both
+ * fronts wear lowest on the inside, the negative-camber signature.
  *
  * @internal Exported for testing.
  */
 export function buildTireWearReport(telemetry: TelemetryData): TireWearReport | null {
-  const readings: number[] = [];
+  const readings = readTireZoneValues(telemetry, "wear");
 
-  for (const source of CORNERS) {
-    for (const field of [source.left, source.middle, source.right]) {
-      const value = telemetry[field];
-
-      if (typeof value !== "number" || !Number.isFinite(value)) return null;
-
-      readings.push(value);
-    }
-  }
-
-  if (readings.every((value) => value === 0)) return null;
+  if (readings === null) return null;
 
   const corners = {} as Record<TireCorner, TireCornerWear>;
   let heaviest: { corner: TireCorner; zone: TireZone } | null = null;
   let heaviestTread = Infinity;
 
-  for (const source of CORNERS) {
-    const left = (telemetry[source.left] as number) * 100;
-    const middle = (telemetry[source.middle] as number) * 100;
-    const right = (telemetry[source.right] as number) * 100;
-    const byZone: Record<TireZone, number> =
-      source.side === "left" ? { inside: right, middle, outside: left } : { inside: left, middle, outside: right };
+  TIRE_CORNERS.forEach((source, i) => {
+    const left = readings[i * 3]! * 100;
+    const middle = readings[i * 3 + 1]! * 100;
+    const right = readings[i * 3 + 2]! * 100;
+    const byZone = zonesFromCarSides(source.side, left, middle, right);
 
     // Strictly lower only, so a tie keeps the zone earlier in ZONES.
     let zone: TireZone = ZONES[0];
@@ -114,12 +82,12 @@ export function buildTireWearReport(telemetry: TelemetryData): TireWearReport | 
 
     corners[source.corner] = { ...byZone, tread: byZone[zone], zone };
 
-    // Strictly lower only, so a tie keeps the corner earlier in CORNERS.
+    // Strictly lower only, so a tie keeps the corner earlier in TIRE_CORNERS.
     if (byZone[zone] < heaviestTread) {
       heaviestTread = byZone[zone];
       heaviest = { corner: source.corner, zone };
     }
-  }
+  });
 
   // Unreachable with four finite corners; keeps the type honest.
   if (heaviest === null) return null;
@@ -131,59 +99,39 @@ function has(pending: ReadonlyArray<PendingEvent>, event: PendingEvent["event"])
   return pending.some((p) => p.event === event);
 }
 
+/**
+ * `stallVisit` is the tick's answer from `updateStallVisit`, which the caller
+ * resolves once per tick and hands to every consumer. It is required so this
+ * diff can never advance the latch a second time on a tick — see
+ * `updateStallVisit`.
+ */
 export function diffTireWear(
   state: TranslatorState,
   telemetry: TelemetryData,
   emit: EmitFn,
   pending: ReadonlyArray<PendingEvent>,
+  stallVisit: StallVisit,
 ): void {
   // A saved replay scrubbed through a pit stop never reaches this diff: it
   // reads `IsReplayPlaying === false` while `SimMode === "replay"`, which the
   // translator's guard has held back since #1324 (it used to be a gate here),
   // and the replay-entry wipe drops a stored report with the rest of the state.
-  const isOnTrack = telemetry.IsOnTrack ?? false;
-  const onPitRoad = telemetry.OnPitRoad ?? false;
-  const inPitStall = telemetry.PlayerCarInPitStall ?? false;
-  const surface = telemetry.PlayerTrackSurface ?? TrkLoc.NotInWorld;
 
-  // 1. Where the car came from. Pit-road ticks match neither branch, so the
-  //    flag rides unchanged from the circuit to the box.
-  if (!isOnTrack || surface === TrkLoc.NotInWorld) {
-    state.tireWearDroveOnCircuit = false;
-  } else if (!onPitRoad && !inPitStall) {
-    state.tireWearDroveOnCircuit = true;
-  }
-
-  // 2. How the car arrived on pit road. One that arrives already in its box was
-  //    put there (tow, reset, garage) — the same signature `diffPitLane`'s
-  //    dirt-oval guard uses — so it did not drive in, even if the tick before it
-  //    read "on the circuit". A stored report is deliberately left alone here:
-  //    entering pit road cancels nothing in `diffPitReadback`.
-  if (has(pending, "pitLane.entered")) {
-    state.tireWearStallDriveIn = false;
-
-    if (inPitStall || surface === TrkLoc.InPitStall) state.tireWearDroveOnCircuit = false;
-  }
-
-  // 3. The readback cancels its exit fire on a fresh approach, and the report
+  // 1. The readback cancels its exit fire on a fresh approach, and the report
   //    goes with it — one lifecycle, so the report can neither outlive the fire
-  //    it waits for nor be lost while that fire still plays.
+  //    it waits for nor be lost while that fire still plays. Entering pit road
+  //    cancels nothing in `diffPitReadback`, so it leaves a stored report alone.
   if (has(pending, "pitLane.approaching")) {
     state.tireWearReport = null;
   }
 
-  // 4. This stall visit is a stop only if the car drove into it.
-  if (has(pending, "pitStall.entered")) {
-    state.tireWearStallDriveIn = state.tireWearDroveOnCircuit;
+  // 2. Leaving the box: the readings are the ones taken on arrival, and the
+  //    visit is a stop only if the car drove into it.
+  if (stallVisit.departed) {
+    state.tireWearReport = stallVisit.driveIn ? buildTireWearReport(telemetry) : null;
   }
 
-  // 5. Leaving the box: the readings are the ones taken on arrival.
-  if (has(pending, "pitStall.departed")) {
-    state.tireWearReport = state.tireWearStallDriveIn ? buildTireWearReport(telemetry) : null;
-    state.tireWearStallDriveIn = false;
-  }
-
-  // 6. Behind the exit readback, from the same tick — never ahead of it.
+  // 3. Behind the exit readback, from the same tick — never ahead of it.
   const exitReadback = pending.some((p) => p.event === "pitService.readbackRequested" && p.data.reason === "exit");
 
   if (exitReadback && state.tireWearReport !== null) {

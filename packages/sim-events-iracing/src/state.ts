@@ -10,6 +10,7 @@ import {
   type IncidentType,
   type PitBoxMark,
   type RadarState,
+  type TireCorner,
   type TireWearReport,
   TrackWetness,
 } from "@iracedeck/event-bus";
@@ -22,6 +23,24 @@ import type { CornerMarker } from "@iracedeck/track-data";
  * lap. `"none"` when no full-course caution is out.
  */
 export type CautionPhase = "none" | "waving" | "caught" | "one-to-go";
+
+/**
+ * One tire's carcass temperatures across the tread (issue #254), in °C and
+ * unrounded. The zones are named from the car's centreline, as in the tire
+ * wear report's `TireCornerWear`: on a left-side tire the sim's L is the
+ * outside and R the inside, mirrored on the right side.
+ */
+export type TireCornerTemps = { inside: number; middle: number; outside: number };
+
+/**
+ * The tire temperatures from the last time the car came in from a run, as
+ * `getLastStopTireTemps()` reports them (issue #254). iRacing refreshes these
+ * values only as the car comes in — at a pit stop, at a tow or reset to the
+ * pits, and when the driver leaves the car — and holds them through the whole
+ * next stint, so this is a reading of the run that ended there — after a tire
+ * change, of the set that came off — never a live temperature.
+ */
+export type LastStopTireTemps = { corners: Record<TireCorner, TireCornerTemps> };
 
 /**
  * One full-course caution, as `getCautionEpisode()` reports it (issue #1286):
@@ -586,7 +605,9 @@ export type TranslatorState = {
    */
   lastTickInPreStart: boolean;
 
-  // ── Tire wear of a stop (issue #1108) ──────────────────────────────────
+  // ── How the car reached its stall (issues #1108, #254) ─────────────────
+  // Written by `updateStallVisit` only (`diff/stall-visit.ts`), which hands
+  // the tire wear report the tick's answer; no other diff reads these two.
   /**
    * The car was last seen driving on the circuit: set on a tick with
    * `IsOnTrack`, off pit road, out of the stall and in the world; cleared when
@@ -595,9 +616,11 @@ export type TranslatorState = {
    * survives the drive down the lane — which is what tells a stop the driver
    * drove into from a garage start or a tow.
    */
-  tireWearDroveOnCircuit: boolean;
+  stallVisitDroveOnCircuit: boolean;
   /** Whether the current stall visit is a drive-in — latched at `pitStall.entered`. */
-  tireWearStallDriveIn: boolean;
+  stallVisitDriveIn: boolean;
+
+  // ── Tire wear of a stop (issue #1108) ──────────────────────────────────
   /**
    * The report read at `pitStall.departed`, waiting for the exit readback that
    * publishes it. Dropped on `pitLane.approaching` — the one event on which
@@ -607,6 +630,31 @@ export type TranslatorState = {
    * still follows it.
    */
   tireWearReport: TireWearReport | null;
+
+  // ── Tire temperatures of the last stop (issue #254) ────────────────────
+  /**
+   * The twelve carcass temperatures as of the last time the car came in from a
+   * run: taken once, on the tick that finds them refreshed while the car
+   * stands in its box (a stop, a tow or a reset) or the driver has left the
+   * car (`diff/tire-temps.ts`). `null` until the first one. Unlike nearly
+   * everything else in this struct it OUTLIVES a replay visit and a session
+   * change — both wipes in `translator.ts` carry it over, because the garage
+   * is where a driver tuning pressures and camber reads it — and is cleared by
+   * a disconnect and by a saved replay. Read via `getLastStopTireTemps()`.
+   */
+  lastStopTireTemps: LastStopTireTemps | null;
+  /**
+   * The run a reading is taken from: the twelve values (the sim's order,
+   * L / M / R per corner) as last seen while the car was driving on the
+   * circuit, which a stop, a tow, a reset or leaving the car is measured
+   * against to tell that the sim refreshed them. `null` when there is no run
+   * to read: before the car has driven on the circuit, once a reading is taken
+   * and once the driver has left the car — and within a run while the values
+   * cannot be trusted, when there is nothing to measure against. It rides
+   * through a session change with the reading, so a run a session change ends
+   * is still read, and the replay wipe drops it.
+   */
+  tireTempsOnCircuit: readonly number[] | null;
 
   // ── Track wetness (issue #526) ──────────────────────────────────────────
   // Tracks `TelemetryData.TrackWetness` across ticks so the diff can emit one
@@ -1428,9 +1476,13 @@ export function createInitialState(): TranslatorState {
     pitReadbackPreStartFireAt: 0,
     lastTickInPreStart: false,
 
-    tireWearDroveOnCircuit: false,
-    tireWearStallDriveIn: false,
+    stallVisitDroveOnCircuit: false,
+    stallVisitDriveIn: false,
+
     tireWearReport: null,
+
+    lastStopTireTemps: null,
+    tireTempsOnCircuit: null,
 
     trackWetnessInitialized: false,
     lastTrackWetness: TrackWetness.Unknown,

@@ -51,6 +51,7 @@ import { getGlobalColors } from "@iracedeck/settings";
 import {
   type GapNeighbor,
   getFuelStats,
+  getLastStopTireTemps,
   getLiveGaps,
   getLivePosition,
   getLiveRacePositions,
@@ -63,6 +64,14 @@ import {
 import sessionInfoTemplate from "../../../icons/session-info.svg";
 import { readoutKindFor, resolveReadoutFigure } from "./readout-request.js";
 import { SessionInfoSettings } from "./session-info-settings.js";
+import {
+  generateTireTempsGraphic,
+  resolveTireTempsDisplay,
+  TIRE_TEMPS_KEY_CANVAS,
+  type TireTempsDisplay,
+  tireTempsStateKey,
+  tireTempsTitle,
+} from "./tire-temps.js";
 
 const BACKGROUND_FLASH = "#e74c3c";
 
@@ -406,6 +415,7 @@ const GRAPHIC_ONLY_MODES: ReadonlySet<SessionInfoSettings["mode"]> = new Set<Ses
   "track-wetness",
   "gaps",
   "wind",
+  "tire-temps",
 ]);
 
 function quantizeArrowDeg(degrees: number): number {
@@ -635,6 +645,8 @@ export type SessionInfoModeState = {
   wind?: WindDisplay | null;
   /** Which limit the time-remaining key is counting down, so the title can follow the value. */
   sessionLimit?: SessionLimitDisplay;
+  /** Resolved figures of the last pit stop's tire temperatures. */
+  tireTemps?: TireTempsDisplay;
 };
 
 /**
@@ -676,6 +688,10 @@ export function generateSessionInfoSvg(
 
   if (settings.mode === "track-wetness") {
     actionDefaultTitle = trackWetnessLabel(trackWetnessState);
+  } else if (settings.mode === "tire-temps") {
+    // Says "pit" so the figures are never read as live, and names the corner
+    // when the key shows only one (#254).
+    actionDefaultTitle = tireTempsTitle(settings.tireTempCorner);
   } else if (settings.mode === "fuel" && settings.fuelSubMode === "lastLap") {
     actionDefaultTitle = "LAST LAP";
   } else if (settings.mode === "fuel" && settings.fuelSubMode === "avgN") {
@@ -738,6 +754,13 @@ export function generateSessionInfoSvg(
     );
   } else if (settings.mode === "wind") {
     graphicContent = generateWindGraphic(windDisplay ?? null, settings.fontSize, textColor);
+  } else if (settings.mode === "tire-temps") {
+    // With no display passed in there is no reading to show: `--` in every slot.
+    graphicContent = generateTireTempsGraphic(
+      modeState.tireTemps ?? resolveTireTempsDisplay(settings, null, undefined),
+      TIRE_TEMPS_KEY_CANVAS,
+      { fontSize: resolveValueFontSize(settings.fontSize), textColor },
+    );
   }
 
   // The graphic content carries the whole display for these modes, so clear
@@ -956,7 +979,8 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
     const telemetry = this.sdkController.getCurrentTelemetry();
     const wind = this.resolveWind(settings, telemetry);
     const sessionLimit = this.resolveSessionLimit(settings, telemetry);
-    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit);
+    const tireTemps = this.resolveTireTemps(settings, telemetry);
+    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit, tireTemps);
     const isFlashing = this.flashStates.get(ev.action.id) ?? false;
 
     // Resolve flag colors for flags mode
@@ -967,7 +991,7 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
       value,
       isFlashing,
       colorOverride,
-      this.resolveModeState(settings, telemetry, value, wind, sessionLimit),
+      this.resolveModeState(settings, telemetry, value, wind, sessionLimit, tireTemps),
     );
     await ev.action.setTitle("");
     await this.setKeyImage(ev, svgDataUri);
@@ -1000,6 +1024,7 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
     telemetry: TelemetryData | null,
     wind?: WindDisplay | null,
     sessionLimit?: SessionLimitDisplay,
+    tireTemps?: TireTempsDisplay,
   ): string {
     // Track wetness renders its label inside the graphic content. The label is still
     // returned here so the state-key cache busts on state transitions; generateSessionInfoSvg
@@ -1038,6 +1063,19 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
     // keeps a car turning through a corner from busting the key every tick.
     if (settings.mode === "wind") {
       return wind ? `${wind.arrowDeg ?? "calm"}|${wind.label}` : WIND_PLACEHOLDER;
+    }
+
+    // Tire Temperatures (issue #254): the graphic carries the whole display;
+    // this string only busts the state-key cache. It is built from the figures
+    // and bands the key would show, never from the reading itself — the
+    // translator hands out a new object on every tick of a stop. Like the wind
+    // model, the display is resolved once by the caller and passed in, so the
+    // key and the graphic can never disagree; a caller that only wants the
+    // value resolves it here.
+    if (settings.mode === "tire-temps") {
+      return tireTempsStateKey(
+        tireTemps ?? resolveTireTempsDisplay(settings, getLastStopTireTemps(), telemetry?.DisplayUnits),
+      );
     }
 
     if (!telemetry) {
@@ -1438,7 +1476,8 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
   ): Promise<void> {
     const wind = this.resolveWind(settings, telemetry);
     const sessionLimit = this.resolveSessionLimit(settings, telemetry);
-    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit);
+    const tireTemps = this.resolveTireTemps(settings, telemetry);
+    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit, tireTemps);
     const isFlashing = this.flashStates.get(contextId) ?? false;
     const colorOverride = this.resolveFlagColorOverride(settings, telemetry);
     const stateKey = this.buildStateKey(settings, value, isFlashing, colorOverride?.background);
@@ -1452,7 +1491,7 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
       value,
       isFlashing,
       colorOverride,
-      this.resolveModeState(settings, telemetry, value, wind, sessionLimit),
+      this.resolveModeState(settings, telemetry, value, wind, sessionLimit, tireTemps),
     );
 
     await this.updateKeyImage(contextId, svgDataUri);
@@ -1469,6 +1508,7 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
     value: string,
     wind: WindDisplay | null | undefined,
     sessionLimit: SessionLimitDisplay | undefined,
+    tireTemps: TireTempsDisplay | undefined,
   ): SessionInfoModeState {
     return {
       trackWetness: telemetry?.TrackWetness as TrackWetness | undefined,
@@ -1476,7 +1516,25 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
       gaps: settings.mode === "gaps" ? getLiveGaps() : undefined,
       wind,
       sessionLimit,
+      tireTemps,
     };
+  }
+
+  /**
+   * The Tire Temperatures figures (issue #254): the translator's last pit-stop
+   * reading, polled on the render pass the way the gaps are, in the driver's
+   * display units. `null` before the first reading, which shows `--`.
+   * Resolved once per render pass and handed to both the state key and the
+   * graphic, the contract the wind model keeps, so the two read the same
+   * reading. `undefined` for every other mode.
+   */
+  private resolveTireTemps(
+    settings: SessionInfoSettings,
+    telemetry: TelemetryData | null,
+  ): TireTempsDisplay | undefined {
+    return settings.mode === "tire-temps"
+      ? resolveTireTempsDisplay(settings, getLastStopTireTemps(), telemetry?.DisplayUnits)
+      : undefined;
   }
 
   /**
@@ -1534,14 +1592,15 @@ export class SessionInfo extends SimIRacingAction<SessionInfoSettings> {
   private renderIcon(contextId: string, settings: SessionInfoSettings, telemetry: TelemetryData | null): string {
     const wind = this.resolveWind(settings, telemetry);
     const sessionLimit = this.resolveSessionLimit(settings, telemetry);
-    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit);
+    const tireTemps = this.resolveTireTemps(settings, telemetry);
+    const value = this.extractDisplayValue(settings, telemetry, wind, sessionLimit, tireTemps);
 
     return generateSessionInfoSvg(
       settings,
       value,
       this.flashStates.get(contextId) ?? false,
       this.resolveFlagColorOverride(settings, telemetry),
-      this.resolveModeState(settings, telemetry, value, wind, sessionLimit),
+      this.resolveModeState(settings, telemetry, value, wind, sessionLimit, tireTemps),
     );
   }
 
