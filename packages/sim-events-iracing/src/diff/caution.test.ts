@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { createInitialState } from "../state.js";
-import { resolveCautionLineup } from "./caution-lineup.js";
 import { diffCaution, LAST_LAP_CHECKPOINT_PCT } from "./caution.js";
+import { resolvePaceLineup } from "./pace-lineup.js";
 import type { PendingEvent } from "./types.js";
 
 const ticks = JSON.parse(
@@ -503,14 +503,14 @@ describe("the caution episode", () => {
     const state = createInitialState();
     const { emit } = collect();
 
-    diffCaution(state, flagTick(RACING), sessionInfo, null, emit, 1_000); // seed
-    diffCaution(state, flagTick(WAVING), sessionInfo, null, emit, 1_020);
-    diffCaution(state, flagTick(STATIC), sessionInfo, null, emit, 1_040);
-    diffCaution(state, flagTick(GREEN_HELD), sessionInfo, null, emit, 1_060);
+    diffCaution(state, flagTick(RACING), sessionInfo, null, emit, { now: 1_000 }); // seed
+    diffCaution(state, flagTick(WAVING), sessionInfo, null, emit, { now: 1_020 });
+    diffCaution(state, flagTick(STATIC), sessionInfo, null, emit, { now: 1_040 });
+    diffCaution(state, flagTick(GREEN_HELD), sessionInfo, null, emit, { now: 1_060 });
 
     expect(state.cautionRestartedAt).toBeNull();
 
-    diffCaution(state, flagTick(RESTART), sessionInfo, null, emit, 1_080);
+    diffCaution(state, flagTick(RESTART), sessionInfo, null, emit, { now: 1_080 });
 
     expect(state.cautionRestartedAt).toBe(1_080);
   });
@@ -875,6 +875,9 @@ describe("the caution lineup", () => {
 
     diffCaution(state, counted(WAVING), info, canonicalLeader(1), emit);
 
+    // One read: the lineup's one resolution. The catch-up measurement (#1168)
+    // reads the array too, but not while the caution waves — nothing reads its
+    // answer there for a car that carries no pace flag.
     expect(reads).toBe(1);
 
     diffCaution(state, counted(STATIC | 0x4), info, canonicalLeader(1), emit); // a green flying: not read
@@ -999,7 +1002,7 @@ describe("the caution lineup", () => {
     const { events, emit } = collect();
     const info = playerSessionInfo(0);
     const fired: Array<{ t: number; followCarIdx: number | null }> = [];
-    const caught: Array<{ t: number; restartPosition: number | null }> = [];
+    const caught: Array<{ t: number; lineupPosition: number | null }> = [];
 
     for (const tick of ticks) {
       const before = events.length;
@@ -1016,7 +1019,7 @@ describe("the caution lineup", () => {
           expect(e.data).toEqual({});
           caught.push({
             t: tick.t,
-            restartPosition: resolveCautionLineup(telemetry, info, true)?.restartPosition ?? null,
+            lineupPosition: resolvePaceLineup(telemetry, info, true)?.lineupPosition ?? null,
           });
         }
       }
@@ -1026,8 +1029,8 @@ describe("the caution lineup", () => {
     // rows: 9th at the first pickup, 3rd at the second. Both pickups are single
     // file with the pace car at the head of the lineup, so both are anchored.
     expect(caught).toEqual([
-      { t: 333.57, restartPosition: 9 },
-      { t: 630.95, restartPosition: 3 },
+      { t: 333.57, lineupPosition: 9 },
+      { t: 630.95, lineupPosition: 3 },
     ]);
 
     // Car 0 ran 9th. It followed car 4 single file and car 1 once the field

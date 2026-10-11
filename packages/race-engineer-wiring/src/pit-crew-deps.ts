@@ -79,10 +79,20 @@ export function buildPitCrewDeps(
     // because `paceCar.deployed` / `paceCar.off` also fire at a rolling start),
     // and the episode that scopes the lineup change's memory of the car last
     // named to one caution (issue #1286).
-    getCautionLineup: () => sim.getCautionLineup(),
+    getPaceLineup: () => sim.getPaceLineup(),
     getUnderFullCourseCaution: () => sim.isUnderFullCourseCaution(),
     getCautionPhase: () => sim.getCautionPhase(),
     getCautionEpisode: () => sim.getCautionEpisode(),
+    // The rolling-start formation (issue #1167): its identity while one runs,
+    // `null` otherwise. The three formation callouts gate on it not being
+    // `null`, and the lineup change scopes its memory of the car last named to
+    // its id, as the caution's does to the episode.
+    getRollingStartFormation: () => sim.getRollingStartFormation(),
+    // The caution catch-up (issue #1168): whether a call to close up is
+    // warranted right now, read live. Both catch-up callouts ask it at speak
+    // time, so one queued behind another line is refused once the driver has
+    // closed up; `null` while the player holds no pace row.
+    getCautionGap: () => sim.getCautionGap(),
     logger: logger.createScope("PitCrewScenarios"),
     getPitActionsAllowed: () => sim.isPitActionsAllowed(),
     getReadbackSnapshot: () => sim.getReadbackSnapshot(),

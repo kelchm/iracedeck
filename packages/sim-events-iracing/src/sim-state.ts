@@ -5,7 +5,7 @@
  * telemetry it computed it from, so a support case can tell a wrong input
  * from a wrong calculation. This module is the SHAPE of the translator's
  * section: curated keys first (`fuel`, `order`, `gaps`, `opponentFlags`,
- * `caution`, `session`), then `raw` — the whole `TranslatorState` and the
+ * `caution`, `rollingStart`, `session`), then `raw` — the whole `TranslatorState` and the
  * instance's own flags, uncurated.
  *
  * `readSimState()` in `translator.ts` gathers the parts, because the
@@ -34,7 +34,6 @@
  */
 import { isPostRace, type ReplayState, type TelemetryData } from "@iracedeck/iracing-sdk";
 
-import type { CautionLineup } from "./diff/caution-lineup.js";
 import {
   estimateFuelLapsLeft,
   type FuelLapsLeftEstimate,
@@ -42,9 +41,16 @@ import {
   resolveFuelRaceCoverage,
 } from "./diff/fuel-laps-left.js";
 import type { FuelLap, FuelLapTracker, FuelStats } from "./diff/fuel-laps.js";
-import type { CautionEpisode, CautionPhase, RaceFinishResult, TranslatorState } from "./state.js";
+import type { PaceLineup } from "./diff/pace-lineup.js";
+import type {
+  CautionEpisode,
+  CautionPhase,
+  RaceFinishResult,
+  RollingStartFormation,
+  TranslatorState,
+} from "./state.js";
 import type { TrackDirection } from "./track-type.js";
-import type { GapNeighbor, LiveGaps, LiveOpponentFlags, LivePosition } from "./translator.js";
+import type { CautionGap, GapNeighbor, LiveGaps, LiveOpponentFlags, LivePosition } from "./translator.js";
 
 /**
  * Why the laps-of-fuel-left count is compared with no race distance: the
@@ -113,7 +119,25 @@ export type SimOrderState = {
 export type SimCautionState = {
   phase: CautionPhase;
   episode: CautionEpisode | null;
-  lineup: CautionLineup | null;
+  lineup: PaceLineup | null;
+  /**
+   * The catch-up reading (`getCautionGap()`, issue #1168): the gap to the car
+   * the player follows against the pack's spacing, whether a call is warranted
+   * and, when it is not, every reason why. `null` without a lineup. The
+   * episode behind it — the dwell, the last call, the reminder count — is
+   * under `raw.state`, as `cautionCatchUp*`.
+   */
+  gap: CautionGap | null;
+};
+
+/**
+ * The rolling start, as its accessor reports it (issue #1167): the running
+ * formation's identity, `null` while none runs. The lineup a formation is
+ * read from is the one under `caution.lineup` — `getPaceLineup()` answers for
+ * both phases, and its `anchor` says which frame it was counted in.
+ */
+export type SimRollingStartState = {
+  formation: RollingStartFormation | null;
 };
 
 /** What the translator knows about the session the car is in. */
@@ -205,6 +229,7 @@ export type SimStateSnapshot =
       gaps: LiveGaps | null;
       opponentFlags: LiveOpponentFlags | null;
       caution: SimCautionState;
+      rollingStart: SimRollingStartState;
       session: SimSessionState;
       raw: SimRawState;
     };
@@ -230,6 +255,7 @@ export type SimStateParts = {
   gaps: LiveGaps | null;
   opponentFlags: LiveOpponentFlags | null;
   caution: SimCautionState;
+  rollingStart: SimRollingStartState;
   session: SimSessionState;
   state: TranslatorState;
   instance: SimInstanceFlags;
@@ -422,6 +448,7 @@ export function buildSimState(parts: SimStateParts): SimStateSnapshot {
     gaps: parts.gaps,
     opponentFlags: parts.opponentFlags,
     caution: parts.caution,
+    rollingStart: parts.rollingStart,
     session: parts.session,
     raw: { state, instance: parts.instance, replay: parts.replay },
   };

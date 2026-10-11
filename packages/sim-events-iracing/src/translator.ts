@@ -49,8 +49,8 @@ import {
 import { type ILogger, silentLogger } from "@iracedeck/logger";
 import { type CornerMarker, resolveCornerMarkers } from "@iracedeck/track-data";
 
-import { type CautionLineup, resolveCautionLineup } from "./diff/caution-lineup.js";
-import { diffCaution } from "./diff/caution.js";
+import { type CautionGapMeasurement, measureCautionGap } from "./diff/caution-gap.js";
+import { CATCH_UP_CLEAR_MULTIPLE, type CatchUpBlock, diffCaution, resolveCatchUpBlocks } from "./diff/caution.js";
 import { CORNER_CALLOUT_DEFAULT_LEAD_SECONDS, diffCornerName } from "./diff/corner-name.js";
 import { diffDamage } from "./diff/damage.js";
 import { diffFlags } from "./diff/flags.js";
@@ -81,6 +81,7 @@ import {
 import { diffOpponentPit } from "./diff/opponent-pit.js";
 import { diffOvertakes } from "./diff/overtakes.js";
 import { diffPaceLaps, resolvePaceCarIdx } from "./diff/pace-laps.js";
+import { type PaceLineup, resolvePaceLineup } from "./diff/pace-lineup.js";
 import { diffPitBoxCountdown } from "./diff/pit-box-countdown.js";
 import { diffPitLane } from "./diff/pit-lane.js";
 import { buildSnapshot as buildReadbackSnapshot, diffPitReadback } from "./diff/pit-readback.js";
@@ -99,6 +100,7 @@ import { diffToggles } from "./diff/toggles.js";
 import { diffTrackWetness, resolveReportedTrackWetness } from "./diff/track-wetness.js";
 import type { PendingEvent } from "./diff/types.js";
 import { calculateCanonicalRacePositions } from "./race-order.js";
+import { resolveSessionType } from "./session-type.js";
 import { buildDegradedSimState, buildSimState, type SimStateSnapshot } from "./sim-state.js";
 import { resolveStandingStart } from "./start-lights.js";
 import {
@@ -108,9 +110,16 @@ import {
   type GapNeighborState,
   type LastStopTireTemps,
   type RaceFinishResult,
+  type RollingStartFormation,
   type TranslatorState,
 } from "./state.js";
-import { isOvalTrack, resolveTrackDirection, resolveTrackType, type TrackDirection } from "./track-type.js";
+import {
+  isOvalTrack,
+  parseTrackLengthMeters,
+  resolveTrackDirection,
+  resolveTrackType,
+  type TrackDirection,
+} from "./track-type.js";
 
 const SUBSCRIPTION_ID = "__sim-events-iracing__";
 
@@ -121,7 +130,7 @@ type TranslatorInstance = {
   state: TranslatorState;
   latestTelemetry: TelemetryData | null;
   /**
-   * The lineup `getCautionLineup()` last resolved, keyed on the IDENTITY of
+   * The lineup `getPaceLineup()` last resolved, keyed on the IDENTITY of
    * the telemetry snapshot and session-info object it was resolved from
    * (issue #1127 review). One expansion of a caution callout reads the lineup
    * through up to five vocabulary entries, and every one of them resolved it
@@ -131,10 +140,22 @@ type TranslatorInstance = {
    * changes, so an unchanged pair means unchanged inputs. `null` until first
    * asked.
    */
-  cautionLineupMemo: {
+  paceLineupMemo: {
     telemetry: TelemetryData;
     sessionInfo: Record<string, unknown> | null;
-    lineup: CautionLineup | null;
+    lineup: PaceLineup | null;
+  } | null;
+  /**
+   * The measurement `getCautionGap()` last took (issue #1168), on the same
+   * identity key as {@link TranslatorInstance.paceLineupMemo} and for the same
+   * reason: a speak gate and several vocabulary entries ask within one
+   * expansion. Only the MEASUREMENT is kept — what the translator's latches
+   * make of it is read fresh on every call. `null` until first asked.
+   */
+  cautionGapMemo: {
+    telemetry: TelemetryData;
+    sessionInfo: Record<string, unknown> | null;
+    measurement: CautionGapMeasurement;
   } | null;
   /** Cached pit speed limit (m/s) parsed from session YAML. 0 = not parsed. */
   pitSpeedLimitMps: number;
@@ -316,7 +337,8 @@ export function initializeSimEventsIracing(
     logger,
     state: createInitialState(),
     latestTelemetry: null,
-    cautionLineupMemo: null,
+    paceLineupMemo: null,
+    cautionGapMemo: null,
     pitSpeedLimitMps: 0,
     pitSpeedLimitKey: "",
     lastTickInReplay: false,
@@ -1187,11 +1209,55 @@ export function getCautionEpisode(): CautionEpisode | null {
 }
 
 /**
- * The player's place in the caution lineup as of the latest tick (issue #1127)
- * — who to follow, which lane, and where they would restart. `null` when the
- * translator isn't initialized, no telemetry has arrived, or the field carries
- * no readable lineup (no pace arrays, no player index, or a player the re-form
- * has not placed — a car in the pits holds no row).
+ * The running rolling-start formation's identity (issue #1167), or `null`
+ * while none runs — and before the translator is initialized. The formation's
+ * counterpart of {@link getCautionEpisode}: for a consumer that remembers
+ * something within ONE formation — the car the engineer last named — and must
+ * not carry it into a re-grid or a later session. It keys its memory on `id`
+ * and treats anything recorded under another id as nothing remembered.
+ *
+ * A formation runs from the `ParadeLaps` entry edge of a rolling start until
+ * the session leaves `ParadeLaps` or the green is held or out, and one already
+ * running when the translator first sees the session is adopted silently
+ * (`diff/rolling-start.ts`). `firstFollowCarIdx` is the formation's first
+ * readable follow car, the lineup `rollingStart.lineup.changed` never
+ * reports, for a consumer that needs a reference before anything has been
+ * said. Both survive a replay glance; the first tick back closes a formation
+ * that ended meanwhile.
+ *
+ * This is the translator's own state, never a re-derivation of
+ * `SessionState` and the green bits, so it holds its last value while no
+ * tick can advance it — a replay, a missing telemetry read — and a consumer
+ * never has to treat "unknown" as a third answer.
+ */
+export function getRollingStartFormation(): RollingStartFormation | null {
+  if (!instance || instance.state.rollingStartFormationId === null) return null;
+
+  return {
+    id: instance.state.rollingStartFormationId,
+    firstFollowCarIdx: instance.state.rollingStartFirstFollowCarIdx,
+  };
+}
+
+/**
+ * Whether a rolling-start formation is running (issue #1167) — exactly
+ * {@link getRollingStartFormation} not being `null`, so the two can never
+ * disagree. What the formation callouts gate on: a queued formation call must
+ * never drain into the launch, and once the green is held the green-held line
+ * owns the moment. `false` before the translator is initialized.
+ */
+export function isRollingStartFormation(): boolean {
+  return getRollingStartFormation() !== null;
+}
+
+/**
+ * The player's place in the pace lineup as of the latest tick — under a
+ * caution (issue #1127) or in a rolling-start formation (issue #1167), told
+ * apart by the tick's own data and reported as `anchor` — who to follow, which
+ * lane, and their place in it. `null` when the translator isn't initialized,
+ * no telemetry has arrived, or the field carries no readable lineup (no pace
+ * arrays, no player index, or a player the re-form has not placed — a car in
+ * the pits holds no row).
  *
  * Read at fire time rather than frozen into an event payload (the
  * {@link getReadbackSnapshot} rationale): the lineup keeps moving while the
@@ -1205,24 +1271,118 @@ export function getCautionEpisode(): CautionEpisode | null {
  * Deliberately NOT gated on {@link isUnderFullCourseCaution}: the pace arrays
  * are the source of truth for what they describe, and a caller that wants "the
  * lineup, but only under caution" composes the two rather than having the
- * narrower answer forced on it.
+ * narrower answer forced on it. That is also why it answers before the green
+ * of a rolling start, where no caution is out.
  */
-export function getCautionLineup(): CautionLineup | null {
+export function getPaceLineup(): PaceLineup | null {
   if (!instance || !instance.latestTelemetry) return null;
 
   const telemetry = instance.latestTelemetry;
   const sessionInfo = instance.controller.getSessionInfo() as Record<string, unknown> | null;
-  const memo = instance.cautionLineupMemo;
+  const memo = instance.paceLineupMemo;
 
-  // Memoised per tick on the identity of both inputs — see `cautionLineupMemo`
+  // Memoised per tick on the identity of both inputs — see `paceLineupMemo`
   // for why identity is a sound key here. One expansion asks up to five times.
   if (memo !== null && memo.telemetry === telemetry && memo.sessionInfo === sessionInfo) return memo.lineup;
 
-  const lineup = resolveCautionLineup(telemetry, sessionInfo, isOvalTrack(sessionInfo));
+  const lineup = resolvePaceLineup(telemetry, sessionInfo, isOvalTrack(sessionInfo));
 
-  instance.cautionLineupMemo = { telemetry, sessionInfo, lineup };
+  instance.paceLineupMemo = { telemetry, sessionInfo, lineup };
 
   return lineup;
+}
+
+/**
+ * The live answer to "should the engineer tell this driver to close up", as
+ * {@link getCautionGap} gives it (issue #1168).
+ */
+export type CautionGap = {
+  /**
+   * A catch-up call is warranted NOW: catch-up is live — nothing in
+   * `blockedBy` — and the gap to the car the player follows is at or above
+   * `CATCH_UP_CLEAR_MULTIPLE` × the pack's spacing. What the two catch-up
+   * callouts' speak gate asks.
+   *
+   * The CLEAR multiple, deliberately, though `caution.gapOpened` needs the
+   * RAISE multiple and a dwell. The gate does not ask "would a gap open
+   * now", it asks "is the gap still open", and an open gap stays open down
+   * to the clear multiple — that is the hysteresis. A first call queued
+   * behind another line with the gap at 2.6× must still be spoken when it
+   * has closed to 2.2×, since the driver is still off the pack, and a
+   * reminder is emitted for any gap that is still open, band included. A
+   * gate on the raise multiple would drop both. Once the ratio is under the
+   * clear multiple the call is refused: he has closed up.
+   */
+  warranted: boolean;
+  /**
+   * The player has been waved round and has not yet taken his slot at the
+   * tail: `WavedAround` set and the drive-round latch not. Issue #1169's
+   * condition; nothing reads it yet.
+   */
+  wavingAround: boolean;
+  /** Every reason catch-up cannot be judged right now; empty when it is live. */
+  blockedBy: CatchUpBlock[];
+  /** The tick's measurement: the gap, the pack spacing, their ratio, and what they were read from. */
+  measurement: CautionGapMeasurement;
+};
+
+/**
+ * Whether the player has dropped back from the car he lines up behind, as of
+ * the latest tick (issue #1168). `null` when the translator isn't
+ * initialized, no telemetry has arrived, or there is no lineup — a player who
+ * holds no row has no car to close up on.
+ *
+ * Read at SPEAK time, like {@link getPaceLineup} which it is built on: a
+ * catch-up call that waits behind another line must be refused if the driver
+ * has closed up meanwhile. The lineup is the memoised one, and the measurement
+ * is memoised here on the same key — the identity of the telemetry snapshot
+ * and the session-info object — so a gate and several vocabulary entries
+ * asking within one expansion pay for one measurement. The translator's
+ * latches (the caution phase, the pickup's time, the drive-round latch, the
+ * pit-exit episode) are read fresh on top of it on every call, and the settle
+ * and pit-exit clocks against `Date.now()`.
+ *
+ * "Live" is `resolveCatchUpBlocks`, the very function the diff that emits
+ * `caution.gapOpened` / `caution.gapStillOpen` asks, so the event and the
+ * gate cannot disagree about the same tick; the diff has set its state before
+ * either event is published, so `warranted` already reads true inside their
+ * handlers.
+ *
+ * Deliberately NOT gated on a caution being out by an early return: the
+ * phase is the first entry of `blockedBy`, and a caller sees why.
+ */
+export function getCautionGap(): CautionGap | null {
+  if (!instance || !instance.latestTelemetry) return null;
+
+  const lineup = getPaceLineup();
+
+  if (lineup === null) return null;
+
+  const telemetry = instance.latestTelemetry;
+  const sessionInfo = instance.controller.getSessionInfo() as Record<string, unknown> | null;
+  const memo = instance.cautionGapMemo;
+  let measurement: CautionGapMeasurement;
+
+  if (memo !== null && memo.telemetry === telemetry && memo.sessionInfo === sessionInfo) {
+    measurement = memo.measurement;
+  } else {
+    measurement = measureCautionGap(
+      telemetry,
+      sessionInfo,
+      lineup,
+      resolveTrackLengthMeters(instance.state, sessionInfo, telemetry),
+    );
+    instance.cautionGapMemo = { telemetry, sessionInfo, measurement };
+  }
+
+  const blockedBy = resolveCatchUpBlocks(instance.state, telemetry, measurement, Date.now());
+
+  return {
+    warranted: blockedBy.length === 0 && measurement.ratio !== null && measurement.ratio >= CATCH_UP_CLEAR_MULTIPLE,
+    wavingAround: measurement.paceFlags.wavedAround && !instance.state.cautionProcedureJoined,
+    blockedBy,
+    measurement,
+  };
 }
 
 /**
@@ -1527,10 +1687,15 @@ function fuelLapsLeftStats(self: TranslatorInstance): FuelStats {
  * `TranslatorState` and the instance's own flags under `raw`. Exactly
  * `{ initialized: false }` while there is no translator.
  *
- * Read ONLY when a snapshot is taken. It is synchronous, logs nothing and
- * writes nothing, so taking a snapshot cannot change what is being reported;
- * the one effect is the per-tick memo `getCautionLineup()` fills, which that
- * accessor writes for every caller. Nothing here runs per tick.
+ * Read ONLY when a snapshot is taken. It is synchronous and logs nothing, and
+ * it changes nothing that is being reported. What it does write is what its
+ * accessors write for every caller: the two per-tick memos, the lineup's
+ * (`getPaceLineup()`) and the caution gap's measurement (`getCautionGap()`),
+ * and the track-length cache that `getCautionGap()` reads through, which
+ * re-parses `WeekendInfo.TrackLength` when the track or the session has
+ * changed since it was last read. Each holds a pure function of the tick, so
+ * the next reader gets the answer it would have computed. Nothing here runs
+ * per tick.
  *
  * The curated keys are what the public accessors answer, called as any other
  * consumer calls them, so the snapshot shows what the actions and the Race
@@ -1609,7 +1774,13 @@ export function readSimState(): SimStateSnapshot {
       },
       gaps: getLiveGaps(),
       opponentFlags: getLiveOpponentFlags(),
-      caution: { phase: getCautionPhase(), episode: getCautionEpisode(), lineup: getCautionLineup() },
+      caution: {
+        phase: getCautionPhase(),
+        episode: getCautionEpisode(),
+        lineup: getPaceLineup(),
+        gap: getCautionGap(),
+      },
+      rollingStart: { formation: getRollingStartFormation() },
       session: {
         type: sessionType,
         trackDirection: getTrackDirection(),
@@ -1812,6 +1983,59 @@ function wipeStateForReplay(self: TranslatorInstance): void {
     // with the phase, so they ride with it.
     cautionEpisodeId: self.state.cautionEpisodeId,
     cautionFirstFollowCarIdx: self.state.cautionFirstFollowCarIdx,
+    // What catch-up keeps (issue #1168): six fields, and nothing else of it.
+    //
+    // With the phase, the drive-round latch: a car waved round to the tail
+    // that has taken its slot must not be silenced again by a glance, and one
+    // still on its way round must not be told to "catch" a car a lap up the
+    // road. And the pickup's timestamp: the settle window is the phase's, and
+    // re-starting it on the way back would hold an open gap for ten seconds
+    // for nothing.
+    //
+    // The pit stop: whether the player was on pit road at the last reading
+    // and since when, and the pit-exit episode an exit opened — when, and
+    // whether its one call has been made. These are facts about the live car,
+    // and the rules that hang on them cannot be re-derived from the first
+    // tick back: a driver who opens the replay from his stall and drives out
+    // a second after closing it would otherwise be met as an ordinary
+    // dropped-back car — no grace to get up to speed, the ahead-of-slot rule
+    // back in force, reminders — and one who glances after the pit-exit call
+    // would get it a second time. The baseline also has to ride through for
+    // the diff's own first-sight rule: with none, the first reading back that
+    // found him on pit road would count as a stop, and a blink there as an
+    // exit. A session change clears all six with everything else
+    // (`resetPerSessionState`), and a caution that ended during the glance
+    // takes the latch, the timestamp and the pit-exit episode with it on the
+    // first tick back; the baseline is not the caution's and stays.
+    //
+    // The ORDINARY episode (`cautionCatchUpFollowCarIdx` and below: the
+    // dwell, a suspense and its candidate, the last call and the reminder
+    // count) is pointedly NOT preserved — the machine is level-armed and
+    // re-derives an open gap within one dwell of the first live tick back.
+    // The accepted cost is exactly that a driver who had heard the first call
+    // and up to both reminders for a gap hears a fresh first call for it, and
+    // may be reminded again. Nor is what the latch has merely OBSERVED of a
+    // drive-round still in progress (`cautionProcedureAwaySeen`, the in-place
+    // clock): it is observed again from the first tick back, and until then
+    // the car stays suppressed, which is the safe side.
+    cautionProcedureJoined: self.state.cautionProcedureJoined,
+    cautionCaughtAt: self.state.cautionCaughtAt,
+    cautionCatchUpLastOnPitRoad: self.state.cautionCatchUpLastOnPitRoad,
+    cautionCatchUpPitRoadSince: self.state.cautionCatchUpPitRoadSince,
+    cautionCatchUpPitExitAt: self.state.cautionCatchUpPitExitAt,
+    cautionCatchUpPitExitCalled: self.state.cautionCatchUpPitExitCalled,
+    // The rolling-start formation's identity and first follow car (issue
+    // #1167), for the episode's reason: a glance at the replay during the
+    // formation is the same formation still running, and the callouts that
+    // gate on it must not go quiet for the rest of it. The rolling-start
+    // diff's seed, which the first tick back runs, closes a formation the
+    // tick contradicts — one that ended during the glance — so it cannot
+    // survive as a latch. Its baselines (`rollingStartInitialized`,
+    // `lastInParadeLaps`, `rollingStartFollowCarIdx`) are pointedly NOT
+    // preserved: the cue must not re-fire on the way back, and a change of the
+    // car ahead is never announced across two timelines' lineups.
+    rollingStartFormationId: self.state.rollingStartFormationId,
+    rollingStartFirstFollowCarIdx: self.state.rollingStartFirstFollowCarIdx,
     // …and whether the one-to-green lap's position call is still owed, for
     // the same reason: a glance on the last caution lap must neither lose that
     // call nor repeat it. Its baseline (`cautionLastLapDistPct`) re-seeds.
@@ -2448,7 +2672,7 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // tests in `translator.test.ts`). Leaving a replay for a live session is a
   // disconnect (`handleDisconnect`) or a session change
   // (`resetPerSessionState`), and both recreate the state whole.
-  diffCaution(self.state, telemetry, sessionInfo, canonicalPositions, emit, now);
+  diffCaution(self.state, telemetry, sessionInfo, canonicalPositions, emit, { now, trackLengthMeters });
 
   // Opponent pit entries (issue #622) — consumes the same canonical frozen
   // order as diffOvertakes on the same tick. Race-only gating is diff-side
@@ -2633,17 +2857,6 @@ function publish(self: TranslatorInstance, pending: PendingEvent, telemetry: Tel
   self.bus.publish(envelope);
 }
 
-function resolveSessionType(sessionInfo: Record<string, unknown> | null, telemetry: TelemetryData): string {
-  if (!sessionInfo) return "";
-
-  const sessions = (sessionInfo.SessionInfo as Record<string, unknown> | undefined)?.Sessions as
-    Array<Record<string, unknown>> | undefined;
-  const sessionNum = telemetry.SessionNum ?? 0;
-  const current = sessions?.[sessionNum as number];
-
-  return (current?.SessionType as string) ?? "";
-}
-
 /**
  * Collapse iRacing's raw `SessionType` string ("Practice", "Lone Practice",
  * "Offline Testing", "Open Qualify", "Lone Qualify", "Race", "Warmup", …)
@@ -2820,7 +3033,7 @@ function resolveIsMultiClass(sessionInfo: Record<string, unknown> | null): boole
 }
 
 /**
- * Parse `SessionInfo.WeekendInfo.TrackLength` ("X.XXX km" or "X.XXX miles") into
+ * Read `SessionInfo.WeekendInfo.TrackLength` ("X.XXX km" or "X.XXX miles") in
  * meters and cache the result on `TranslatorState` keyed by `(TrackID, SessionNum)`
  * (issue #574). Returns `null` when the YAML hasn't been seen yet, the field is
  * absent, or the format doesn't parse — the overtake diff treats null as "no
@@ -2844,20 +3057,9 @@ function resolveTrackLengthMeters(
     return state.trackLengthMeters;
   }
 
-  const raw = weekend?.TrackLength;
-
-  if (typeof raw === "string") {
-    const match = /([\d.]+)\s*(km|mi(?:les?)?)/i.exec(raw);
-
-    if (match) {
-      const value = parseFloat(match[1]!);
-      const unit = match[2]!.toLowerCase();
-
-      if (Number.isFinite(value) && value > 0) {
-        state.trackLengthMeters = unit.startsWith("mi") ? value * 1609.344 : value * 1000;
-      }
-    }
-  }
+  // The parse itself is `parseTrackLengthMeters` (`track-type.ts`), a pure
+  // function of the session info; only the cache lives here.
+  state.trackLengthMeters = parseTrackLengthMeters(sessionInfo);
 
   return state.trackLengthMeters;
 }

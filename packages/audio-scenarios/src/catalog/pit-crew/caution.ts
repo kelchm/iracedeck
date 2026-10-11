@@ -1,9 +1,10 @@
 /**
- * The full-course caution, narrated (issue #1127) — nine contracts over the
- * translator's caution events: the caution out and who to follow, the pace
- * car reaching the track, the pickup ("two to green"), each extra lap, one
- * lap to green, a change to the car ahead, your race position on the last
- * lap, the pace car peeling off, and the green.
+ * The full-course caution, narrated (issues #1127, #1168) — eleven contracts
+ * over the translator's caution events: the caution out and who to follow,
+ * the pace car reaching the track, the pickup ("two to green"), each extra
+ * lap, one lap to green, a change to the car ahead, a gap opened to the car
+ * ahead and its reminders, your race position on the last lap, the pace car
+ * peeling off, and the green.
  *
  * As everywhere since #1064, the code here decides WHETHER and WHEN the
  * engineer speaks and how the fire is scheduled; WHAT he says lives in the
@@ -24,7 +25,7 @@
  * car, not past the checkered — so the events stay publishable and
  * harness-firable while only a driver in a race hears them.
  *
- * **Eight of the nine also re-check the caution at SPEAK time**, and that is
+ * **Ten of the eleven also re-check the caution at SPEAK time**, and that is
  * the price of being queueable rather than a belt on a brace. A queued fire
  * replays WITHOUT its `where:` being re-evaluated, and it may wait up to the
  * engine's max wait (eight seconds by default, issue #1185) for a busy bus to
@@ -211,6 +212,41 @@
  * The lineup change shares the same choice for the same reason, and adds a
  * `queueBehind` the other two do without: it can arrive at any stage of the
  * caution, beside any sibling.
+ *
+ * **The two catch-up calls (issue #1168) are the family's lightest, and the
+ * translator decides when they are due.** A dwell, a hysteresis band, a
+ * reminder clock and a drive-round latch need state and time, which a diff
+ * module holds and a script condition does not; this layer adds the words and
+ * one speak-time question — is catching up still warranted — asked of the
+ * translator's own `getCautionGap()`, so the event and the gate cannot
+ * disagree about a tick. Neither carries a `family`: a nag must never share
+ * the family of the calls it runs beside (the #951 lesson), or a catch-up
+ * would cut "One lap to green" mid-sentence. The first call sits a notch
+ * below the follow, change and position calls, so on a busy last caution lap
+ * the queue plays every one of them first and a full queue drops the
+ * catch-up, never one of them: it is the call with a second chance, the
+ * reminder. The reminder is the ONE caution call that is not queueable — a
+ * deliberate exception to the family's standing ruling, confirmed by the
+ * maintainer: it recurs, so one lost to a busy bus is replaced by the next,
+ * and a queued nag would only arrive late. Both name the car ahead, so both
+ * record it as named (finding 2): a lineup change to that same car afterwards
+ * is not news. The change call does not wait behind them — it is the heavier
+ * of the two and speaks first, and the catch-up then names the car the
+ * change just did.
+ *
+ * **The first catch-up call never names the same car twice in a short
+ * window.** Its gate asks about the car ahead NOW, and so does its script,
+ * while the translator's episode is about one particular car: when the car
+ * ahead changes, the episode suspends and, a dwell later, re-keys to the new
+ * car and raises `caution.gapOpened` again. A first call for the old car that
+ * was still waiting for the bus drains inside that dwell, is admitted on the
+ * live gap to the NEW car and says "catch car B" — and then the translator's
+ * own call for car B says it again, seconds later. Nothing in the event says
+ * which car it was raised for, by design (no payload; the car is read live),
+ * so the call remembers the car it last named and when, and refuses that car
+ * again inside {@link CATCH_UP_REPEAT_GUARD_MS}. A different car is never
+ * refused by it, and the reminder is untouched: a reminder for the same car
+ * thirty seconds on is the design.
  */
 import { AudioBus, AudioChannel } from "@iracedeck/audio-service";
 import { type CalloutIdOf, CAUTION_CALLOUTS } from "@iracedeck/callout-settings";
@@ -219,15 +255,16 @@ import { Flags, hasFlag, type TelemetryData } from "@iracedeck/iracing-sdk";
 import type { ILogger } from "@iracedeck/logger";
 import {
   type CautionEpisode,
-  type CautionLineup,
   type CautionPhase,
   getLatestTelemetry,
+  type PaceLineup,
 } from "@iracedeck/sim-events-iracing";
 
 import type { ScenarioContract, SpeakGate } from "../../dsl.js";
 import { poolRef, WEIGHT } from "../../dsl.js";
 import type { IScenarioEngine } from "../../interpreter.js";
 import { CAUTION_MAX_QUEUE_WAIT_MS, liveRaceCar, WAVING_FLAG_COOLDOWN_MS } from "./flag-alerts.js";
+import { createNamedCarMemory, type LastNamedCar } from "./named-car.js";
 import { type LivePositionResolver, selectLivePosition } from "./position-readout.js";
 
 /** iRacing's GreenHeld bit in the event's own telemetry — false when there is none to read. */
@@ -238,7 +275,7 @@ const greenHeld = (telemetry: TelemetryData | null): boolean =>
 export type CautionCalloutId = CalloutIdOf<typeof CAUTION_CALLOUTS>;
 
 /**
- * Reader the plugins wire to `getCautionLineup()` from
+ * Reader the plugins wire to `getPaceLineup()` from
  * `@iracedeck/sim-events-iracing`: the player's place in the caution lineup as
  * of the latest tick, or `null` when there is none to read.
  *
@@ -251,7 +288,7 @@ export type CautionCalloutId = CalloutIdOf<typeof CAUTION_CALLOUTS>;
  * can substitute its own, and the contract layer holds no reference to live
  * global state that a second consumer would have to reset.
  */
-export type CautionLineupResolver = () => CautionLineup | null;
+export type PaceLineupResolver = () => PaceLineup | null;
 
 /**
  * Reader the plugins wire to `isUnderFullCourseCaution()`: the translator's own
@@ -284,17 +321,33 @@ export type CautionPhaseResolver = () => CautionPhase;
 export type CautionEpisodeResolver = () => CautionEpisode | null;
 
 /**
+ * Reader the plugins wire to `getCautionGap()` from
+ * `@iracedeck/sim-events-iracing`: the translator's measurement of the gap to
+ * the car you line up behind under caution, or `null` when there is no
+ * lineup to measure (issue #1168). Only one answer is read here —
+ * `warranted`: catching up can be judged at all, no drive-round procedure is
+ * in progress, and the gap is still open. It is the catch-up calls'
+ * speak-time gate, asked of the same reader that raised the event so the two
+ * cannot disagree about one tick. Declared structurally, so the contract
+ * layer names no translator type for it.
+ */
+export type CautionGapResolver = () => { readonly warranted: boolean } | null;
+
+/**
  * What {@link buildCautionContracts} is built against: the phase; the
  * lineup, read at SPEAK time by the two gates that require the player to
- * still hold a pace row and by the four that record the car they name; the
- * episode that scopes that record; and the live opt-in, which the change call
- * asks of the follow call before anything is named (module header, finding 2).
+ * still hold a pace row and by the six that record the car they name; the
+ * episode that scopes that record; the live opt-in, which the change call
+ * asks of the follow call before anything is named (module header, finding
+ * 2); and the gap to the car ahead, which the two catch-up calls ask at speak
+ * time.
  */
 export type CautionContractDeps = {
   getCautionPhase: CautionPhaseResolver;
-  getCautionLineup: CautionLineupResolver;
+  getPaceLineup: PaceLineupResolver;
   getCautionEpisode: CautionEpisodeResolver;
   isCautionCalloutEnabled: (id: CautionCalloutId) => boolean;
+  getCautionGap: CautionGapResolver;
 };
 
 /** The clip group every car number is spoken from (issue #1127) — `09` and `9` are different clips. */
@@ -332,6 +385,30 @@ export const CAUTION_FOLLOW_DELAY_MS = 2500;
  */
 export const CAUTION_LINEUP_CHANGE_DELAY_MS = 2000;
 
+/**
+ * How long the first catch-up call refuses to name the car it last named
+ * (issue #1168; module header, last paragraph). It has to cover the longest
+ * the two fires for one car can be apart. The stale call names the new car no
+ * earlier than the tick that car appears ahead. The translator raises its own
+ * call for that car one dwell later — `CATCH_UP_DWELL_MS`, 3 s, counted from
+ * the same tick while the old episode is in suspense — and that fire may then
+ * wait for the bus as long as any gated caution call,
+ * `CAUTION_MAX_QUEUE_WAIT_MS`, 20 s. So: the dwell plus the wait, 23 s. (A
+ * stale call still WAITING when the second event arrives needs no guard: the
+ * newer fire of the same contract replaces it in the queue.)
+ *
+ * It also stays under the translator's reminder interval
+ * (`CATCH_UP_REMINDER_MS`, 30 s), so the guard never keeps a driver from
+ * hearing about one car for longer than the reminders themselves are spaced:
+ * a gap to the same car that closes and opens again later is a new call.
+ *
+ * Written as a number rather than derived from the translator's constant
+ * because this module is loaded by every family test that stubs the
+ * translator package whole, and reading an export at load time would fail
+ * them; `caution.test.ts` holds it to the two values it is made of.
+ */
+export const CATCH_UP_REPEAT_GUARD_MS = 23_000;
+
 /** The one spelling of a caution callout's scenario id — the contracts and {@link SCENARIO_ID_TO_CAUTION_ID} both come from it. */
 export function cautionScenarioId(id: CautionCalloutId): string {
   return `pit-crew.caution-${id}`;
@@ -339,10 +416,14 @@ export function cautionScenarioId(id: CautionCalloutId): string {
 
 /**
  * Every caution call the lineup change waits behind (issue #1286) — all but
- * itself and the restart, which is CRITICAL with `interrupt` and ends the
- * caution: a change still WAITING then meets its gate at replay and is refused.
- * (One still PLAYING is cut and stashed admitted — the module header's
- * residual.)
+ * itself, the restart and the two catch-up calls. The restart is CRITICAL
+ * with `interrupt` and ends the caution: a change still WAITING then meets
+ * its gate at replay and is refused. (One still PLAYING is cut and stashed
+ * admitted — the module header's residual.) The catch-up calls are lighter
+ * than the change and name the same car, so the change goes FIRST: waiting
+ * behind one would have it refused for a car only the catch-up had named,
+ * and the driver would be told to catch a car nobody said he now follows
+ * (issue #1168).
  */
 const LINEUP_CHANGE_QUEUE_BEHIND: readonly string[] = (
   ["follow", "pace-car-out", "field-caught", "extra-lap", "one-to-go", "position", "pace-car-off"] as const
@@ -386,26 +467,32 @@ function cautionContract(
   };
 }
 
-/** The car a build last named, tagged with the caution it was named in — see `lastNamed` in the build. */
-type LastNamedCar = { episodeId: number; followCarIdx: number };
+/** The car the first catch-up call last named, and when — see `lastCatchUp` in the build. */
+type LastCatchUp = { followCarIdx: number; at: number };
+
+/** What a build keeps: the car last named in a caution, and the first catch-up call's own record. */
+type CautionBuildState = { lastNamed: LastNamedCar | null; lastCatchUp: LastCatchUp | null };
 
 /**
- * How the Telemetry Snapshot reaches the one piece of state this family
- * keeps (issue #1387). `lastNamed` lives in a build's closure, where nothing
- * outside the build can read it, so each build leaves a reader of its own
+ * How the Telemetry Snapshot reaches the state this family keeps (issue
+ * #1387). The car last named lives in a build's own memory (`named-car.ts`)
+ * and the first catch-up call's record in the build's closure, where nothing
+ * outside the build can read them, so each build leaves a reader of its own
  * here and the newest wins — the plugin builds once, in `registerPitCrew`.
  * `null` until the first build. The state itself stays in the build: two
  * builds never share a record.
  */
-let readNewestLastNamed: (() => LastNamedCar | null) | null = null;
+let readNewestBuildState: (() => CautionBuildState) | null = null;
 
 /**
  * This file's state, for the Telemetry Snapshot (issue #1387): the car the
  * newest build last named and the caution it named it in — what a lineup
- * change is judged against. A pure read; `null` before any build.
+ * change is judged against — and the car its first catch-up call last named
+ * and when, which is what refuses that car again for a while (issue #1168).
+ * A pure read; both `null` before any build.
  */
-export function readCautionDebugState(): { lastNamed: LastNamedCar | null } {
-  return { lastNamed: readNewestLastNamed?.() ?? null };
+export function readCautionDebugState(): CautionBuildState {
+  return readNewestBuildState?.() ?? { lastNamed: null, lastCatchUp: null };
 }
 
 /**
@@ -414,15 +501,16 @@ export function readCautionDebugState(): { lastNamed: LastNamedCar | null } {
  * moments: at event time, to say whether THIS occurrence of an event is news
  * (the pace car's, which fires at a rolling start too; the follow call's,
  * whose flag re-raises; the pickup's and the pace-car-off's, which read the
- * stage), and again at speak time in eight of the nine. And one build holds
- * the car last named, shared by the four calls that record it and the change
+ * stage), and again at speak time in ten of the eleven. And one build holds
+ * the car last named, shared by the six calls that record it and the change
  * call that reads it (issue #1286) — see the module header for all three.
  */
 export function buildCautionContracts({
   getCautionPhase,
-  getCautionLineup,
+  getPaceLineup,
   getCautionEpisode,
   isCautionCalloutEnabled,
+  getCautionGap,
 }: CautionContractDeps): readonly ScenarioContract[] {
   /** The shared gate, plus "a caution is actually out" for an event that also fires elsewhere. */
   const underCautionCar = (e: SimEventOf<SimEventName>): boolean => liveRaceCar(e) && getCautionPhase() !== "none";
@@ -435,7 +523,7 @@ export function buildCautionContracts({
    */
   const stillLinedUp: SpeakGate = {
     description: "Re-checked at speak time: the full-course caution is still out and you still hold a pace row.",
-    admit: () => getCautionPhase() !== "none" && getCautionLineup() !== null,
+    admit: () => getCautionPhase() !== "none" && getPaceLineup() !== null,
   };
 
   /** The family's own gate, built once so the two naming calls below can wrap it. */
@@ -443,57 +531,90 @@ export function buildCautionContracts({
 
   /**
    * The car the engineer last told the driver about in THIS caution (issue
-   * #1286), recorded by the four calls that name it when their gate admits —
+   * #1286), recorded by the six calls that name it when their gate admits —
    * the one place a claim may be committed (#1137): the script has expanded
    * and the ops take the bus next. Tagged with the caution's id so a record
-   * from an earlier caution — or session — never counts.
+   * from an earlier caution — or session — never counts. The mechanism is
+   * `named-car.ts`'s, shared with the rolling-start formation (issue #1167);
+   * the memory is this build's own.
    */
-  let lastNamed: LastNamedCar | null = null;
-
-  // The newest build is the one the snapshot reads (issue #1387).
-  readNewestLastNamed = () => lastNamed;
-
-  /** Record the car ahead now as named — nothing while no caution is out or the lineup names no car. */
-  const recordNamed = (): void => {
-    const episode = getCautionEpisode();
-    const followCarIdx = getCautionLineup()?.followCarIdx ?? null;
-
-    if (episode === null || followCarIdx === null) return;
-
-    lastNamed = { episodeId: episode.id, followCarIdx };
-  };
+  const named = createNamedCarMemory({ getEpisode: getCautionEpisode, getPaceLineup });
 
   /**
-   * What a change in `episode` is judged against: the car last named this
-   * caution. Before anything is named, nothing while the follow call can still
-   * name the car itself — switched on, and the field still waving, the only
-   * phase it speaks in — else the caution's first readable lineup. Past the
-   * waving phase a follow call that never played (the plugin started
-   * mid-caution, the driver was not in the car at the flag, the call was
-   * dropped from the bus's queue, or the pack has no follow line) has nothing
-   * more to say, so
-   * waiting for it would leave every genuine change silent until two to green
-   * or one to go.
+   * The car the FIRST catch-up call last told the driver to catch, and when
+   * (issue #1168; module header, last paragraph). Its own record rather than
+   * the memory above: that one answers "which car does the driver know is
+   * ahead", has no clock, and is written by five other calls — a follow or
+   * one-to-go call naming a car must not keep a catch-up call for it silent.
+   * Written in the gate below, on admission only (#1137).
    */
-  const referenceCarIdx = (episode: CautionEpisode): number | null => {
-    if (lastNamed !== null && lastNamed.episodeId === episode.id) return lastNamed.followCarIdx;
+  let lastCatchUp: LastCatchUp | null = null;
 
+  // The newest build is the one the snapshot reads (issue #1387).
+  readNewestBuildState = () => ({ lastNamed: named.read(), lastCatchUp });
+
+  /**
+   * What a change is judged against before anything is named in `episode`:
+   * nothing while the follow call can still name the car itself — switched
+   * on, and the field still waving, the only phase it speaks in — else the
+   * caution's first readable lineup. Past the waving phase a follow call that
+   * never played (the plugin started mid-caution, the driver was not in the
+   * car at the flag, the call was dropped from the bus's queue, or the pack
+   * has no follow line) has nothing more to say, so waiting for it would
+   * leave every genuine change silent until two to green or one to go.
+   */
+  const unnamedReferenceCarIdx = (episode: CautionEpisode): number | null => {
     if (isCautionCalloutEnabled("follow") && getCautionPhase() === "waving") return null;
 
     return episode.firstFollowCarIdx;
   };
 
   /** A speak-time gate that also records the car the call names — on admission only. */
-  const naming = (gate: SpeakGate): SpeakGate => ({
-    description: gate.description,
-    admit: (ctx) => {
-      if (!gate.admit(ctx)) return false;
+  const naming = named.naming;
 
-      recordNamed();
+  /**
+   * The two catch-up calls' gate (issue #1168): the caution is still out, and
+   * the translator still says catching up is warranted — it can be judged, no
+   * drive-round procedure is in progress, and the gap is still open. It is
+   * what keeps a first call that waited for the bus honest once the driver
+   * has closed up, and it refuses outright for a caller that wires no reader.
+   */
+  const gapStillOpen: SpeakGate = {
+    description:
+      "Re-checked at speak time: the full-course caution is still out and the gap to the car ahead is still open.",
+    admit: () => getCautionPhase() !== "none" && getCautionGap()?.warranted === true,
+  };
+
+  /**
+   * The first call's gate: the shared one, and then not the car this call
+   * named less than {@link CATCH_UP_REPEAT_GUARD_MS} ago. The car is the
+   * lineup's follow car, read live — the car the script is about to name.
+   * Admitting records it; a refusal records nothing, so the window runs from
+   * the call the driver actually heard. With no car to read the guard has
+   * nothing to compare and nothing to record.
+   */
+  const firstCatchUp: SpeakGate = {
+    description: `Re-checked at speak time: the full-course caution is still out, the gap to the car ahead is still open, and this call has not named that car in the last ${CATCH_UP_REPEAT_GUARD_MS / 1000} seconds.`,
+    admit: (ctx) => {
+      if (!gapStillOpen.admit(ctx)) return false;
+
+      const followCarIdx = getPaceLineup()?.followCarIdx ?? null;
+
+      if (followCarIdx === null) return true;
+
+      if (
+        lastCatchUp !== null &&
+        lastCatchUp.followCarIdx === followCarIdx &&
+        ctx.now - lastCatchUp.at < CATCH_UP_REPEAT_GUARD_MS
+      ) {
+        return false;
+      }
+
+      lastCatchUp = { followCarIdx, at: ctx.now };
 
       return true;
     },
-  });
+  };
 
   return [
     {
@@ -582,30 +703,53 @@ export function buildCautionContracts({
       speakGate: {
         description:
           "Re-checked at speak time: the caution is still out, you still hold a pace row, and the car ahead is not the one last named in this caution.",
-        admit: (ctx) => {
-          if (!stillLinedUp.admit(ctx)) return false;
-
-          const episode = getCautionEpisode();
-          const now = getCautionLineup()?.followCarIdx ?? null;
-
-          if (episode === null || now === null) return false;
-
-          const reference = referenceCarIdx(episode);
-
-          if (reference === null || now === reference) return false;
-
-          // The car this call names — the one just compared, under the
-          // caution just read.
-          lastNamed = { episodeId: episode.id, followCarIdx: now };
-
-          return true;
-        },
+        // The judgement last: it records the car this call names.
+        admit: (ctx) => stillLinedUp.admit(ctx) && named.admitChange(unnamedReferenceCarIdx),
       },
       description:
         "The car you line up behind under caution changes — a car pitted, or the field re-formed — and two seconds later it is still not the car the engineer last named in this caution.",
       // Decided after the hold. Whether the change is news is the gate's
       // question, asked at speak time against what was actually said.
       when: { event: "caution.lineup.changed", where: underCautionCar },
+    },
+    {
+      ...cautionContract("catch-up", getCautionPhase),
+      // No family, and the lowest caution call but one — see the module
+      // header's closing paragraph. Two notches below the flag family: every
+      // other caution call plays first when several wait, and a full queue
+      // drops this one, which has its reminder as a second chance. Queueable
+      // like the rest of the family; the gate is what keeps a waiting one
+      // honest. Do not "tidy" either back.
+      family: undefined,
+      weight: WEIGHT.SAFETY - 2,
+      // It names the car ahead, so it records it: a lineup change to that
+      // same car afterwards is not news (finding 2). Its own gate, which
+      // also keeps it from naming one car twice in a short window; the
+      // reminder below keeps the shared one.
+      speakGate: naming(firstCatchUp),
+      description:
+        "Under a full-course caution with the field formed up behind the pace car, the gap to the car you line up behind stays well above the pack's own spacing for a few seconds.",
+      when: { event: "caution.gapOpened", where: liveRaceCar },
+    },
+    {
+      ...cautionContract("catch-up-reminder", getCautionPhase),
+      family: undefined,
+      weight: WEIGHT.NORMAL,
+      // The ONE caution call that is not queueable, and deliberately so — a
+      // confirmed exception to "nothing in a caution sequence is dropped for
+      // a busy bus" (issue #1168): the translator repeats it every thirty
+      // seconds while the gap stays open and the driver is not closing, so a
+      // reminder lost to a busy bus is replaced by the next one, and one that
+      // queued would only arrive late. Do not "tidy" it back to the family's.
+      queueable: false,
+      // …and so it takes no longer wait either: the family's 20 s is for a
+      // call that queues.
+      maxQueueWaitMs: undefined,
+      // Names the car ahead, as the first call does.
+      speakGate: naming(gapStillOpen),
+      description:
+        "The gap to the car you line up behind under caution is still open thirty seconds after the last catch-up call and you are not closing it; at most twice for one gap, and never after a pit stop.",
+      when: { event: "caution.gapStillOpen", where: liveRaceCar },
     },
     {
       ...cautionContract("position", getCautionPhase),
@@ -678,9 +822,10 @@ export function buildCautionContracts({
  */
 export const CAUTION_SCENARIO_IDS: readonly string[] = buildCautionContracts({
   getCautionPhase: () => "none",
-  getCautionLineup: () => null,
+  getPaceLineup: () => null,
   getCautionEpisode: () => null,
   isCautionCalloutEnabled: () => true,
+  getCautionGap: () => null,
 }).map((c) => c.id);
 
 /**
@@ -712,17 +857,29 @@ export const POSITION_NUMBER_MAX = 64;
  * before the contracts are defined so the first `setScripts` compile sees it;
  * a later registration only marks the compiled scripts dirty.
  *
- * Every entry reads the lineup afresh through `getCautionLineup`, so a call
+ * Every entry reads the lineup afresh through `getPaceLineup`, so a call
  * that waited behind a busier bus names the car that is ahead at the moment it
  * is spoken rather than the one that was ahead when it fired. The one entry
  * that does not read the lineup is `caution.racePosition`, which reads the
  * canonical live position through `getLivePosition` — the SAME dependency the
  * position-change and race-status vocabularies take, threaded in rather than
  * added beside them, so two readings of "position" cannot drift apart.
+ *
+ * **It registers the rolling-start formation's names as well** (issue #1167):
+ * `rollingStart.followCarNumber`, the four `rollingStart.*` conditions and
+ * `rollingStart.line` are the SAME resolver functions under the start's own
+ * prefix, registered here rather than by the rolling-start family so the two
+ * can never answer differently about one tick. They have names of their own
+ * because the `caution.*` ones are described as answering under a caution,
+ * and a pack author writing a start callout should not have to learn that
+ * they also answer somewhere their names deny. There is deliberately NO
+ * `rollingStart` position var: the lineup place feeds `rollingStart.isLeader`
+ * only, a spoken start position belongs to the race-start brief and the
+ * canonical order, and a pack offered the pace-row place would speak it.
  */
 export function registerCautionVocabulary(
   engine: Pick<IScenarioEngine, "defineVar" | "defineCond" | "defineCase">,
-  getCautionLineup: CautionLineupResolver,
+  getPaceLineup: PaceLineupResolver,
   getLivePosition: LivePositionResolver,
   logger?: ILogger,
 ): void {
@@ -734,7 +891,7 @@ export function registerCautionVocabulary(
    * condition, so the two can never answer differently about the same tick.
    */
   const followCarNumberRef = (): string | null => {
-    const lineup = getCautionLineup();
+    const lineup = getPaceLineup();
 
     // Following the pace car is not a car number. The lineup names the pace
     // car's own number there, and a script that spoke it would say "line up
@@ -758,7 +915,7 @@ export function registerCautionVocabulary(
   engine.defineVar(
     "caution.restartPosition",
     () => {
-      const position = getCautionLineup()?.restartPosition ?? null;
+      const position = getPaceLineup()?.lineupPosition ?? null;
 
       if (position === null || !Number.isInteger(position) || position < 1) return null;
 
@@ -808,37 +965,87 @@ export function registerCautionVocabulary(
     `Your race position at the moment the call is spoken, from the canonical live running order — the number your display shows, in your class in a multi-class race — spoken from the position-number group, which stops at ${POSITION_NUMBER_MAX}; a position past that is null, since there is no clip to say it with. This is what the position call on the last caution lap speaks. It is not your place in the restart lineup (caution.restartPosition): a lapped car lined up ahead of you is behind you in the race, and the two differ by exactly those cars. Null while the order cannot be read. Keep it in an optional clause with the words that introduce it: a null var in a required step aborts the whole callout, silently and at debug level. In the position call that clause IS the whole callout, and there that is right — a position call with no position has nothing true to say.`,
   );
 
+  // One function per answer, handed to both families' registrations below.
+  const hasFollowCarNumber = (): boolean => followCarNumberRef() !== null;
+  const isLeader = (): boolean => getPaceLineup()?.isLeader === true;
+  const followsPaceCar = (): boolean => getPaceLineup()?.followsPaceCar === true;
+  const isDoubleFile = (): boolean => getPaceLineup()?.doubleFile === true;
+  const line = (): "inside" | "outside" | null => getPaceLineup()?.line ?? null;
+
   engine.defineCond(
     "caution.hasFollowCarNumber",
-    () => followCarNumberRef() !== null,
+    hasFollowCarNumber,
     'The car ahead of you in your line can be named — caution.followCarNumber would resolve. False while the pace car is the only thing ahead (ask caution.followsPaceCar for that), while the field carries no readable lineup, and when the session cannot spell the car\'s number. The condition to branch on when a callout must still speak without the number: the one-lap-to-green call says a plain "One lap to green." in the other branch rather than nothing, because an optional clause alone expands to an empty callout and the driver hears no warning at all.',
   );
 
   engine.defineCond(
     "caution.isLeader",
-    () => getCautionLineup()?.isLeader === true,
+    isLeader,
     "You would restart first. Not the same as having only the pace car ahead of you, which is true of both front cars on a double-file restart — that is caution.followsPaceCar.",
   );
 
   engine.defineCond(
     "caution.followsPaceCar",
-    () => getCautionLineup()?.followsPaceCar === true,
+    followsPaceCar,
     "There is nobody ahead of you in your own line, so the pace car is the only thing in front. True for the leader and for the outside front car on a double-file restart; the condition to ask before naming a car number.",
   );
 
   engine.defineCond(
     "caution.isDoubleFile",
-    () => getCautionLineup()?.doubleFile === true,
+    isDoubleFile,
     "The field is lined up in two columns rather than one. iRacing re-forms the field double file on the tick before the one-to-go flag when the restart is a double-file one.",
   );
 
   engine.defineCase(
     "caution.line",
-    () => getCautionLineup()?.line ?? null,
+    line,
     {
       inside: "You line up in the inside lane.",
       outside: "You line up in the outside lane.",
     },
     "Which lane you line up in. Only ever answered on an oval running double file — on any other discipline, and single file, there is no lane to name and the default branch runs.",
+  );
+
+  // The rolling-start formation's names (issue #1167): the same functions,
+  // under the prefix of the moment they are used in. No position var — see
+  // the function comment.
+  engine.defineVar(
+    "rollingStart.followCarNumber",
+    followCarNumberRef,
+    'The car number you form up behind in a rolling-start formation, spoken from the car-number group exactly as the sim spells it — "07" and "7" are different clips. Null while the pace car is the only thing ahead of you, and while the field carries no readable lineup — a rolling start may publish no pace rows at all — so branch on rollingStart.followsPaceCar before naming it, and keep the number in an optional clause with the words that introduce it: a null var in a required step aborts the whole callout, silently and at debug level. Where the callout must still say something without the number, branch on rollingStart.hasFollowCarNumber and give the other branch a numberless wording. The same reading as caution.followCarNumber, under the name of the moment it is used in.',
+  );
+
+  engine.defineCond(
+    "rollingStart.hasFollowCarNumber",
+    hasFollowCarNumber,
+    "The car ahead of you in your line of the formation can be named — rollingStart.followCarNumber would resolve. False while the pace car is the only thing ahead (ask rollingStart.followsPaceCar for that), while the field carries no readable lineup, and when the session cannot spell the car's number. The condition to branch on when a callout must still speak without the number: the pace-car call keeps its numberless line in the other branch rather than nothing, because an optional clause alone expands to an empty callout.",
+  );
+
+  engine.defineCond(
+    "rollingStart.isLeader",
+    isLeader,
+    "You start first — on pole. Not the same as having only the pace car ahead of you, which is true of both front-row cars of a double-file formation — that is rollingStart.followsPaceCar. False when the lineup cannot place you: claiming the pole is not something to do on a guess.",
+  );
+
+  engine.defineCond(
+    "rollingStart.followsPaceCar",
+    followsPaceCar,
+    "There is nobody ahead of you in your own line of the formation, so the pace car is the only thing in front. True for the pole-sitter and for the outside front-row car of a double-file formation; the condition to ask before naming a car number.",
+  );
+
+  engine.defineCond(
+    "rollingStart.isDoubleFile",
+    isDoubleFile,
+    "The formation is lined up in two columns rather than one. Read from the pace rows themselves: no start setting says which shape a formation runs in.",
+  );
+
+  engine.defineCase(
+    "rollingStart.line",
+    line,
+    {
+      inside: "You form up in the inside lane.",
+      outside: "You form up in the outside lane.",
+    },
+    "Which lane you form up in for a rolling start. Only ever answered on an oval running double file — on any other discipline, and single file, there is no lane to name and the default branch runs.",
   );
 }

@@ -61,6 +61,28 @@ export type CautionEpisode = {
 };
 
 /**
+ * One rolling-start formation, as `getRollingStartFormation()` reports it
+ * (issue #1167) — the formation's counterpart of {@link CautionEpisode}: what a
+ * consumer that remembers something within one formation — the car the
+ * engineer last named — scopes that memory to.
+ */
+export type RollingStartFormation = {
+  /**
+   * Never repeats within the process — a re-grid's formation, or a later
+   * session's, cannot match an earlier one's, because the counter behind it
+   * outlives every state reset.
+   */
+  id: number;
+  /**
+   * The first readable follow car of this formation — the lineup the
+   * rolling-start diff does not report as a change. Read on the tick the
+   * formation opens whenever the lineup is readable there, which the pace rows
+   * of a formation are from the first `GetInCar` record; `null` until it is.
+   */
+  firstFollowCarIdx: number | null;
+};
+
+/**
  * One car's open lap-time wait in the replay lap record (issue #1203): the
  * crossing that started `lap + 1` opened it, and it closes on the first tick
  * `CarIdxLastLapTime` moves off `baselineS` — or untimed when `ticksLeft` runs out.
@@ -421,6 +443,138 @@ export type TranslatorState = {
    */
   cautionFirstFollowCarIdx: number | null;
 
+  // ── Caution catch-up (issue #1168) ──────────────────────────────────────
+  /**
+   * The drive-round latch: the player, sent round to the tail under a pace
+   * flag (`WavedAround` / `FreePass` / `EndOfLine`), HAS TAKEN HIS SLOT. Set
+   * by `diffCatchUp` the first tick the gap to the car ahead of him reads
+   * below `CATCH_UP_CLEAR_MULTIPLE` with a flag still set, in any caution
+   * phase; from then on he is an ordinary car in the lineup and a later
+   * drop-back gets the ordinary call. The flag itself cannot say this — it
+   * stays set after joining. Clears with the caution phase.
+   *
+   * PRESERVED across a replay wipe, with `cautionPhase`: a glance must not
+   * lift a suppression the live car is still under, nor re-impose one it has
+   * already settled.
+   */
+  cautionProcedureJoined: boolean;
+  /**
+   * What the drive-round latch has OBSERVED of a flagged player who has not
+   * joined yet, since one reading under the clear multiple cannot say he has
+   * (`trackDriveRound` in `diff/caution.ts`): whether he has been seen away
+   * from his slot — at the raise multiple or ahead of it — after which the
+   * first reading under the clear multiple is him arriving.
+   *
+   * Not preserved across a replay wipe, with the three fields below. Wiped
+   * mid-drive-round it is simply observed again on the first tick back; wiped
+   * after he arrived, the in-place clock joins him one settle window later.
+   */
+  cautionProcedureAwaySeen: boolean;
+  /** The car a flagged, unjoined player has been in place behind — the in-place clock is for ONE car. */
+  cautionProcedureInPlaceCarIdx: number | null;
+  /** When (`now`, ms) he was first read under the clear multiple behind that car, continuously since. */
+  cautionProcedureInPlaceSince: number | null;
+  /** When that was last confirmed, so a stretch with no reading does not count as continuous. */
+  cautionProcedureInPlaceSeenAt: number | null;
+  /**
+   * When (`now`, ms) the phase first read `"caught"` in this caution — the
+   * start of the settle window (`CATCH_UP_SETTLE_MS`) in which no gap is
+   * judged. `null` while the caution waves and while none is out.
+   *
+   * PRESERVED across a replay wipe, with `cautionPhase`, whose property it is:
+   * wiped, the first tick back would start a fresh settle window on a field
+   * that settled long ago, and an open gap would wait ten seconds for nothing.
+   */
+  cautionCaughtAt: number | null;
+  /**
+   * The player's `OnPitRoad` at the catch-up diff's previous reading, for the
+   * pit-exit edge. `null` until the diff has read it once, so a seed is never
+   * an exit. Followed on every tick, caution or not.
+   *
+   * PRESERVED across a replay wipe, with the three fields below: the pit stop
+   * is the live car's, and a glance at the replay from the stall — or one
+   * after the pit-exit call — must not turn the stop into an ordinary
+   * drop-back (no grace, the ahead-of-slot rule back in force, reminders) nor
+   * hand out a second pit-exit call. A session change clears all four with
+   * the rest of the state, and the end of the caution clears the pit-exit
+   * episode with the phase.
+   */
+  cautionCatchUpLastOnPitRoad: boolean | null;
+  /**
+   * When (`now`, ms) the player's current stay on pit road began, `null` off
+   * it. An exit opens a pit-exit episode only after a stay of at least a
+   * dwell: a tick on the pit lane's edge is not a stop. A stay the diff first
+   * met already under way — no earlier reading at all — is backdated by a
+   * dwell, so it counts whenever the exit comes. PRESERVED across a replay
+   * wipe.
+   */
+  cautionCatchUpPitRoadSince: number | null;
+  /**
+   * When (`now`, ms) the player last left pit road under this caution, while
+   * the PIT-EXIT EPISODE that opened runs: nothing is judged for
+   * `CATCH_UP_PIT_EXIT_GRACE_MS` after it, the ahead-of-slot rule is waived,
+   * and the episode makes one call and no reminders. `null` once he has
+   * caught the field or the caution is over; a later stop replaces it.
+   * PRESERVED across a replay wipe.
+   */
+  cautionCatchUpPitExitAt: number | null;
+  /** The running pit-exit episode has made its one call. PRESERVED across a replay wipe, or a glance would buy a second. */
+  cautionCatchUpPitExitCalled: boolean;
+  /**
+   * The car the running catch-up episode is about: set when its dwell starts,
+   * `null` while no episode runs. A different car ahead only SUSPENDS the
+   * episode; it becomes that car's once the change has held for a dwell.
+   */
+  cautionCatchUpFollowCarIdx: number | null;
+  /**
+   * When (`now`, ms) the ratio last rose to the raise multiple and has stayed
+   * there since — the dwell (`CATCH_UP_DWELL_MS`). `null` while it is below.
+   */
+  cautionCatchUpRaisedSince: number | null;
+  /**
+   * When a reading at the raise multiple last confirmed that dwell. A dwell is
+   * continuous: once this is older than `CATCH_UP_UNJUDGED_TOLERANCE_MS` the
+   * next reading starts it again.
+   */
+  cautionCatchUpRaisedSeenAt: number | null;
+  /**
+   * When (`now`, ms) the running episode was first disturbed — a soft block,
+   * or a different car ahead — and has been continuously since: the SUSPENSE.
+   * Nothing is emitted while it runs and the episode's clocks and count are
+   * kept; it ends the episode only after `CATCH_UP_DWELL_MS`, and is cleared
+   * when the original car and liveness return. `null` when undisturbed.
+   */
+  cautionCatchUpSuspendedSince: number | null;
+  /** When a disturbed tick last confirmed the suspense, for the same continuity rule as the dwell. */
+  cautionCatchUpSuspendedSeenAt: number | null;
+  /** The other car ahead during a suspense, whose own dwell is counted meanwhile. */
+  cautionCatchUpCandidateCarIdx: number | null;
+  /** That car's dwell: when the gap to it rose to the raise multiple, continuously since. */
+  cautionCatchUpCandidateRaisedSince: number | null;
+  /** When that car's reading was last taken. */
+  cautionCatchUpCandidateSeenAt: number | null;
+  /** The gap is open: `caution.gapOpened` has fired and the ratio has not fallen below the clear multiple since. */
+  cautionCatchUpOpen: boolean;
+  /**
+   * When (`now`, ms) the open gap was last called — or last came due for a
+   * reminder and was judged, spoken or not. The next reminder is counted from
+   * here, never from a missed due time (the #951 rule).
+   */
+  cautionCatchUpLastCallAt: number | null;
+  /** The gap, in metres, at that moment: what "is he closing" is measured from. */
+  cautionCatchUpLastCallGapMeters: number | null;
+  /** How many reminders the open gap has produced, against `CATCH_UP_MAX_REMINDERS`. */
+  cautionCatchUpReminders: number;
+  //
+  // Everything from `cautionCatchUpFollowCarIdx` down is the ORDINARY episode
+  // and is pointedly NOT preserved across a replay wipe: the machine is
+  // level-armed, so it re-derives an open gap within one dwell of the first
+  // live tick back. The cost is accepted, and it is exactly this: a driver
+  // who had already heard the first call, and up to both reminders, for a gap
+  // hears a fresh first call for it after a glance, and may be reminded
+  // again. What a glance does NOT cost is anything of a pit stop — the four
+  // fields above it ride through — or the drive-round latch.
+
   // ── Rolling-start pace laps (issue #657) ────────────────────────────────
   /**
    * Whether the pace-lap diff has seeded its baseline on the first tick. Seeds
@@ -473,6 +627,45 @@ export type TranslatorState = {
   rollingStartInitialized: boolean;
   /** Previous tick's `SessionState === ParadeLaps`, for ParadeLaps entry-edge detection. */
   lastInParadeLaps: boolean;
+
+  // ── Rolling-start formation (issue #1167) ───────────────────────────────
+  /**
+   * The running rolling-start formation's id, `null` while none runs — the
+   * whole of "is a formation running" (`getRollingStartFormation()`, and
+   * `isRollingStartFormation()` is that not being `null`). Opened on the
+   * `ParadeLaps` entry edge of a rolling start, or adopted silently when the
+   * rolling-start diff's first tick finds one running; closed when the session
+   * leaves `ParadeLaps` or `GreenHeld` or `Green` is set. Taken from a
+   * module-level counter in `diff/rolling-start.ts` that no state reset
+   * touches, so an id a consumer remembers from one formation can never match
+   * a later one.
+   *
+   * PRESERVED across a replay wipe, as {@link cautionEpisodeId} is: a glance at
+   * the replay is the same formation still running, and a consumer that keys
+   * the car it last named on the id must not see a new one. The first tick
+   * back closes it if the formation ended meanwhile.
+   */
+  rollingStartFormationId: number | null;
+  /**
+   * The first readable non-null follow car of the running formation — the
+   * lineup the diff seeds silently rather than reporting. Never overwritten by
+   * a change; it clears only with the formation. PRESERVED across a replay
+   * wipe with {@link rollingStartFormationId}.
+   */
+  rollingStartFirstFollowCarIdx: number | null;
+  /**
+   * The car the player was last seen forming up behind, so a change of it can
+   * be reported (`rollingStart.lineup.changed`). `null` means "not known in
+   * this formation" rather than "nobody": the first lineup a formation reads
+   * SEEDS it silently, and the formation ending clears it.
+   *
+   * Pointedly NOT preserved across a replay wipe, unlike the two fields above
+   * and for {@link cautionFollowCarIdx}'s reason: it is re-read from the very
+   * next tick's pace arrays, and a change the driver missed while looking at
+   * the replay costs one call, where a change announced between two
+   * timelines' lineups would be worse.
+   */
+  rollingStartFollowCarIdx: number | null;
 
   // ── Pit window open/closed (issue #655) ─────────────────────────────────
   /**
@@ -1432,6 +1625,29 @@ export function createInitialState(): TranslatorState {
     cautionEpisodeId: null,
     cautionFirstFollowCarIdx: null,
 
+    cautionProcedureJoined: false,
+    cautionProcedureAwaySeen: false,
+    cautionProcedureInPlaceCarIdx: null,
+    cautionProcedureInPlaceSince: null,
+    cautionProcedureInPlaceSeenAt: null,
+    cautionCaughtAt: null,
+    cautionCatchUpLastOnPitRoad: null,
+    cautionCatchUpPitRoadSince: null,
+    cautionCatchUpPitExitAt: null,
+    cautionCatchUpPitExitCalled: false,
+    cautionCatchUpFollowCarIdx: null,
+    cautionCatchUpRaisedSince: null,
+    cautionCatchUpRaisedSeenAt: null,
+    cautionCatchUpSuspendedSince: null,
+    cautionCatchUpSuspendedSeenAt: null,
+    cautionCatchUpCandidateCarIdx: null,
+    cautionCatchUpCandidateRaisedSince: null,
+    cautionCatchUpCandidateSeenAt: null,
+    cautionCatchUpOpen: false,
+    cautionCatchUpLastCallAt: null,
+    cautionCatchUpLastCallGapMeters: null,
+    cautionCatchUpReminders: 0,
+
     paceLapInitialized: false,
     lastTickInParadeLaps: false,
     paceLapArmed: false,
@@ -1443,6 +1659,10 @@ export function createInitialState(): TranslatorState {
 
     rollingStartInitialized: false,
     lastInParadeLaps: false,
+
+    rollingStartFormationId: null,
+    rollingStartFirstFollowCarIdx: null,
+    rollingStartFollowCarIdx: null,
 
     pitsOpenInitialized: false,
     lastPitsOpen: false,

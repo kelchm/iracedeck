@@ -12,7 +12,8 @@
 export {
   _resetSimEventsIracing,
   getCautionEpisode,
-  getCautionLineup,
+  getCautionGap,
+  getPaceLineup,
   getCautionPhase,
   getDriverSetupName,
   getFuelStats,
@@ -30,6 +31,7 @@ export {
   getRaceFinishResult,
   getRaceStartConditions,
   getReadbackSnapshot,
+  getRollingStartFormation,
   getSessionStartConditions,
   getSessionType,
   getStandingStart,
@@ -39,10 +41,12 @@ export {
   isDamageRepairNeeded,
   isPitActionsAllowed,
   isRaceFinished,
+  isRollingStartFormation,
   isSimEventsIracingInitialized,
   isUnderFullCourseCaution,
   readSimState,
   resolveLeaderLapTimeS,
+  type CautionGap,
   type GapNeighbor,
   type LivePosition,
   type LiveGaps,
@@ -70,20 +74,51 @@ export {
   CORNER_CALLOUT_LEAD_MIN_SECONDS,
   sanitizeCornerCalloutLeadSeconds,
 } from "./diff/corner-name.js";
-// The lineup shape `getCautionLineup()` returns (issue #1127). Exported from
+// The lineup shape `getPaceLineup()` returns (issue #1127). Exported from
 // the module that defines it rather than re-exported through the translator —
 // the `FuelStats` precedent directly below. `resolvePlayerCarIdx` rides with
 // it for the scenario harness, whose caution-shortcut precondition asks THIS
 // reader whether a session names the player rather than restating its rule.
-// `resolveCautionLineup` itself — the pure reader `getCautionLineup()` wraps —
+// `resolvePaceLineup` itself — the pure reader `getPaceLineup()` wraps —
 // rides for the audio-scenarios test that derives the 2026-09-19 snapshot's
 // lineup from the committed fixture rather than typing its number in.
-export { type CautionLineup, resolveCautionLineup, resolvePlayerCarIdx } from "./diff/caution-lineup.js";
+// `PaceLineupAnchor` names the frame of reference the lineup was read in
+// (issue #1167) — a caution's or a rolling-start formation's.
+export {
+  type PaceLineup,
+  type PaceLineupAnchor,
+  type PaceLineupFlags,
+  resolvePaceLineup,
+  resolvePlayerCarIdx,
+} from "./diff/pace-lineup.js";
+// The catch-up call's measurement and thresholds (issue #1168), from the
+// modules that define them. `getCautionGap()` returns the measurement inside
+// its answer; the constants ride for the scenario harness, whose catch-up
+// shortcut holds each step past the translator's own windows rather than
+// restating their lengths, and for anything that explains a reading.
+export {
+  CATCH_UP_MIN_SPACING_SAMPLES,
+  CATCH_UP_PACE_CAR_SPACING_FACTOR,
+  type CautionGapMeasurement,
+} from "./diff/caution-gap.js";
+export {
+  CATCH_UP_CLEAR_MULTIPLE,
+  CATCH_UP_DWELL_MS,
+  CATCH_UP_MAX_REMINDERS,
+  CATCH_UP_PIT_EXIT_GRACE_MS,
+  CATCH_UP_RAISE_MULTIPLE,
+  CATCH_UP_REMINDER_MS,
+  CATCH_UP_SETTLE_MS,
+  CATCH_UP_UNJUDGED_TOLERANCE_MS,
+  type CatchUpBlock,
+  isHardCatchUpBlock,
+} from "./diff/caution.js";
 // The phase `getCautionPhase()` returns (issue #1127) — the callouts that
 // gate on a STAGE of the caution rather than on "is one out" name it — and
 // the episode `getCautionEpisode()` returns (issue #1286), which scopes a
-// callout's memory to one caution.
-export { type CautionEpisode, type CautionPhase, type RaceFinishResult } from "./state.js";
+// callout's memory to one caution. `RollingStartFormation` is the same thing
+// for a rolling-start formation (issue #1167), from `getRollingStartFormation()`.
+export { type CautionEpisode, type CautionPhase, type RaceFinishResult, type RollingStartFormation } from "./state.js";
 // The reading `getLastStopTireTemps()` returns (issue #254): the tire
 // temperatures from the last time the car came in from a run — a pit stop, a
 // tow or reset, or leaving the car — never live ones.
@@ -136,4 +171,17 @@ export {
 } from "./diff/pit-status.js";
 export { resolveRadarState } from "./diff/radar.js";
 export { resolveIsAiRace, resolveStandingStart } from "./start-lights.js";
-export { resolveTrackDirection, resolveTrackType, TrackDirection, TrackType } from "./track-type.js";
+// `isOvalTrack` rides with them for the scenario harness, which asks THIS reader in
+// a shortcut precondition whether the session is an oval (the lane is named
+// only on one) rather than restating its rule.
+// `parseTrackLengthMeters` rides too, for the same harness: its catch-up
+// shortcut asks THIS parser whether the session carries a usable track length
+// rather than restating what "usable" means.
+export {
+  isOvalTrack,
+  parseTrackLengthMeters,
+  resolveTrackDirection,
+  resolveTrackType,
+  TrackDirection,
+  TrackType,
+} from "./track-type.js";

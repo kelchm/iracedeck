@@ -48,12 +48,35 @@ describe("buildPitCrewDeps", () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it("builds all 28 dependencies, so none falls back to DEFAULT_DEPS", () => {
+  it("builds all 30 dependencies, so none falls back to DEFAULT_DEPS", () => {
     const built = buildPitCrewDeps(fakeDeps(), noCaches);
 
-    expect(Object.keys(built)).toHaveLength(28);
+    expect(Object.keys(built)).toHaveLength(30);
 
     for (const [key, value] of Object.entries(built)) expect(value, key).toBeDefined();
+  });
+
+  it("hands the callouts the translator's rolling-start formation, read live (#1167)", () => {
+    let formation: { id: number; firstFollowCarIdx: number | null } | null = null;
+    const built = buildPitCrewDeps(fakeDeps({ sim: fakeSim({ getRollingStartFormation: () => formation }) }), noCaches);
+
+    expect(built.getRollingStartFormation()).toBeNull();
+
+    formation = { id: 7, firstFollowCarIdx: 9 };
+    expect(built.getRollingStartFormation()).toEqual({ id: 7, firstFollowCarIdx: 9 });
+  });
+
+  it("hands the callouts the translator's caution gap, read live (#1168)", () => {
+    let gap: { warranted: boolean } | null = null;
+    const built = buildPitCrewDeps(fakeDeps({ sim: fakeSim({ getCautionGap: () => gap }) }), noCaches);
+
+    expect(built.getCautionGap()).toBeNull();
+
+    gap = { warranted: true };
+    expect(built.getCautionGap()).toEqual({ warranted: true });
+
+    gap = { warranted: false };
+    expect(built.getCautionGap()?.warranted).toBe(false);
   });
 
   it("passes the settings package's callout lookup, live: an on key, an off key and an off-default key (#1350)", () => {

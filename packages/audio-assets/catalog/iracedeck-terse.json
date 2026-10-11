@@ -1,7 +1,7 @@
 {
   "id": "iracedeck-terse",
   "label": "Default (Short callouts)",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "The Default engineer in radio shorthand: shorter race-time calls, most of them the fact itself.",
   "voices": [
     {
@@ -9,8 +9,8 @@
       "label": "Default (Short callouts)"
     }
   ],
-  "bytes": 14197854,
-  "sha256": "546a8519f104660e3a7f7b96898c417e39d7251d4d353db32f4b909f7ac9110a",
-  "url": "https://github.com/niklam/iracedeck/releases/download/voices-iracedeck-terse-1.0.1/iracedeck-terse-1.0.1.zip",
-  "minPluginVersion": "3.5.0"
+  "bytes": 14299759,
+  "sha256": "3fe5c7e8303648671e67b7c9807d9cf177a4f8307d531e13197866a21ee9b14b",
+  "url": "https://github.com/niklam/iracedeck/releases/download/voices-iracedeck-terse-1.1.0/iracedeck-terse-1.1.0.zip",
+  "minPluginVersion": "3.6.0"
 }
