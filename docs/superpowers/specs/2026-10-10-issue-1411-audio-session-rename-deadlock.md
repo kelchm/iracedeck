@@ -58,6 +58,22 @@ The identity strings move behind the namer's mutex: the JS thread writes them in
 
 `destroyAudioEngine` and the environment cleanup hook stop the namer and join it. A namer that is waiting on Windows at that moment finishes when the callback it waits for does, and none of those callbacks waits for the JS thread.
 
+### 6. Teardown takes miniaudio's notification client off Windows' list first
+
+Added on 2026-10-11: the review of the change read a second lock-up out of miniaudio's source, and the probe reproduced it on the addon with decisions 1 to 5 in place.
+
+miniaudio follows a default-device change on Windows' notification thread: it stops the device there, reroutes it and starts it again, waiting each time for the audio worker to answer. `ma_device_uninit` ends that worker first and unregisters miniaudio's `IMMNotificationClient` last. An uninit that lands inside one of those waits locks up for good, with these stacks:
+
+- **JS thread:** `teardownEngine`, `ma_device_uninit__wasapi`, `CDeviceEnumerator::UnregisterEndpointNotificationCallback`, waiting for the notification lock.
+- **Windows' notification thread:** `CallOnDefaultDeviceChanged`, miniaudio's handler, `ma_device_stop`, holding that lock and waiting for an event only the worker signals.
+- **Audio worker:** gone. It saw the device uninitialised and left without signalling.
+
+It needs a teardown within the tens of milliseconds of a reroute round: the idle release 5 s after a sound, a device picked in Settings, a failed start. That is rare by hand, and it does not come from the rename: it has been there since #849 made teardown routine.
+
+`teardownEngine` therefore unregisters miniaudio's notification client itself, before `ma_engine_uninit`. The call returns only when no notification is running, with the device and its worker still whole, and none can start afterwards; miniaudio's own unregister then finds nothing registered, which it ignores. What the JS thread waits for there is a reroute finishing, and a reroute never waits for the JS thread. It is the wait miniaudio's uninit already made, moved to where it is safe.
+
+This reads `device->wasapi.pDeviceEnumerator` and `notificationClient`, which are miniaudio internals, so a miniaudio upgrade rechecks them. Decision 1 stands: neither is the audio client, and this is the call miniaudio itself makes on this thread.
+
 ## Alternatives considered
 
 - **Keep the rename on the audio client, on another thread:** the three-way cycle stays, with the helper in place of the JS thread. The plugin would keep running with its audio dead.
@@ -68,7 +84,7 @@ The identity strings move behind the namer's mutex: the JS thread writes them in
 
 ## Out of scope
 
-- **miniaudio's handling of the role**, and the stop / reroute / start it does on Windows' notification thread.
+- **miniaudio's handling of the role**, and its doing the stop / reroute / start on Windows' notification thread at all. Decision 6 keeps our teardown out of its way; taking the reroute over from miniaudio is a larger change.
 - **The main thread waiting in `ma_engine_start` during a reroute**, which #1347's per-sound check can do. It is bounded by the reroute and belongs to that issue.
 - **macOS and Linux:** the identity is Windows-only and the mock is untouched.
 
@@ -76,10 +92,11 @@ The identity strings move behind the namer's mutex: the JS thread writes them in
 
 No unit test can reach this: the code is COM on a live device, and the suite runs against the native mock. The TypeScript side does not change, so its tests stand as they are.
 
-- **A probe script, committed with the addon:** it opens the device with a session identity, keeps it open, and prints a heartbeat, so a stalled event loop shows as a gap. It is the repeatable way to check this code after a miniaudio upgrade or any later change here.
-- **Manual, before the fix (the control):** with the probe running on the current addon, changing the Windows default output device stops the heartbeat.
+- **A probe script, committed with the addon:** it opens the device with a session identity, keeps it open, and prints a heartbeat, so a stalled event loop shows as a gap. It is the repeatable way to check this code after a miniaudio upgrade or any later change here. It has to keep its main thread busy (`--busy`): the freeze needs the reroute to reach JavaScript a few milliseconds late, and with an idle event loop the addon that froze the plugin survived 21 changes in a row.
+- **Manual, before the fix (the control):** with the probe running with `--busy 15` on the current addon, changing the Windows default output device stops the heartbeat. Measured: on the first change.
 - **Manual, after:**
   - The probe survives 20 default-device changes in a row, some of them seconds apart and some as fast as the picker allows, and its session reads "iRaceDeck" with the icon on the new device each time, in the classic mixer (`sndvol.exe`) and in Settings.
+  - The same with `--cycle 150` added, which closes and reopens the device as the plugin does around its sounds (decision 6). Without decision 6 the probe stalled within a few changes.
   - In the plugin: a Settings **Test** sound, then a default change inside the 5 s the device stays open. The plugin keeps responding and the log shows `Audio device rerouted` with nothing from the watchdog after it.
   - A specific Output Device selected in the plugin: its session is named on that device.
   - Quitting the deck host while a sound plays leaves no plugin process behind.
