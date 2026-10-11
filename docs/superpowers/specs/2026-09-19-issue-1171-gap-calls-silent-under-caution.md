@@ -10,6 +10,23 @@ Three contracts fall silent while a full-course caution is out: `pit-crew.gap-tr
 
 This builds on #1127, cited at its branch HEAD `7a1c6e53c` (`ir-1127`, unmerged when this was written). Every #1127 name below is its spelling there: `getUnderFullCourseCaution`, `getCautionPhase`, `state.cautionPhase`, `diffCaution` and `lap.completed.wasCaution`. The work starts once #1127 merges.
 
+## Amended at implementation (2026-10-11)
+
+#1127 merged, and three later changes moved the code this spec describes before the work started. The decision is unchanged; these four points are where the text below was brought up to date, against `master` at `e095bee56`:
+
+- **`diffGaps` is told about the caution, it does not read the phase.** #1285 gave it an `underFullCourseCaution` parameter, which the translator passes as `state.cautionPhase !== "none"` after `diffCaution` has run. That parameter is used, so the phase still has one derivation.
+- **#1285 already clears the lap history on every caution tick,** and trend calls now read a lap-over-lap rate that needs a lap of same-spot history. What still survived a caution was the callout bookkeeping, and the threshold call, which needs no rate: it fired four times inside one caution on 2026-10-02 (the issue's comment).
+- **The restart lap gets both halves of the opening-lap treatment.** Since #1285 the opening lap is special twice: the grid assumption, and its exclusion from the lap history (so trend calls begin on lap 3). The ruling below gives the restart lap "the opening-lap treatment", so one predicate now carries both. Trend calls therefore resume on the third lap under green (the restart lap is not recorded, the next is, the one after is compared with it), where before this change they resumed on the second.
+- **The single pending slot is a bounded queue** (#1185): up to four waiting fires per bus, each dropped after its maximum wait (8 s by default). Both checks are still needed, for the reasons restated below.
+
+Three details the implementation settled, none of which the text below decided:
+
+- **The hold runs ahead of the diff's own entry gate.** A caution tick the diff cannot otherwise process (the player out of the car) holds the bookkeeping too.
+- **The restart mark is a point in race distance.** A tow under the caution is followed by the next caution tick, and a tow on the restart lap leaves the mark where it is. It is never cleared within a session, only overwritten by the next caution, since a mark the player has passed does nothing.
+- **The mark is preserved across the replay wipe,** the only gap state that is. The race's opening lap survives a glance at the replay because it is read from telemetry, and the restart lap has to survive it the same way.
+
+One inherited behaviour reaches the restart lap with the grid assumption (#933, not changed here): a crossing the opening-lap movement gate holds back stays armed, so if the neighbour is still inside the threshold when that lap ends, "caught" is said then.
+
 ## Rulings confirmed
 
 Niklas confirmed these on 2026-09-19:
@@ -22,7 +39,7 @@ Niklas confirmed these on 2026-09-19:
 ## What the design rests on
 
 - **Both gap contracts are queueable, and neither has a trigger delay.** The trend call is `WEIGHT.CHATTER` and the threshold call is `WEIGHT.NORMAL`. Each already has a `speakGate`: the claim on the shared gap cooldown (#1137). `pit-crew.race-status` is queueable at `WEIGHT.CHATTER` with no `triggerDelay`, and its `speakGate` is the shared `positionReadoutSpeakGate`. None of the three reads the caution today. So "held by a trigger delay" has no case to cover here. If a delay is added later, the speak-time gate below covers it, since a delayed fire meets that gate when it expands.
-- **A pending fire is never re-judged by its `where:`.** The single pending slot has no TTL, and `setPending` replaces the waiting fire whenever `weight >= pending.weight`. So a fire queued behind a busy bus before the throw can drain into the caution. That is the case #1127's own caution gates exist for.
+- **A waiting fire is never re-judged by its `where:`.** A fire that cannot take a busy bus waits in that bus's queue (#1185) for up to its maximum wait, 8 s by default, and meets only its `speakGate` when it drains. So a fire queued before the throw can drain into the caution. That is the case #1127's own caution gates exist for.
 - **The trend state lives in the translator, not in the callout.** `gaps.ts` in `audio-scenarios` holds only the shared cooldown timestamp. Everything that remembers the story lives in `sim-events-iracing`'s `diff/gaps.ts`. For each side that is:
   - the gap extremes since the last announcement (`gapMin/MaxSinceAnnounce*`)
   - the closing-projection latch (`gapContactAnnouncedLaps*`)
@@ -56,26 +73,28 @@ Considered and left out:
 
 **The dependency is `getUnderFullCourseCaution`, not `getCautionPhase`.** Each of the three contracts takes it as a new builder parameter, defaulting to `() => false` as #1127's lap-time and position builders do. Both dependencies are `PitCrewDeps` entries, wired in all three plugins and the harness `main.ts`, so no plugin changes. The boolean is the right one because these gates ask whether a caution is out, never which stage it is at. The translator defines it as `getCautionPhase() !== "none"`, so the two cannot disagree. It is also the question lap-time and position-change already ask, and the race status sits beside them in `registerPitCrew`. `getCautionPhase` is for the caution family's own calls, which need to know the stage.
 
-- **In `where:`, the contract refuses while a caution is out.** For the gap calls the check goes in `gapWhereGates`, after the race-finished latch and before the overtake gate and the pure cooldown read. For the race status it goes beside the race-finished latch, together with `data.wasCaution === true`, written the way #1127's lap-time and position-change gates write it. The `where:` check does work the speak-time gate cannot: it keeps a caution-time fire out of the single pending slot. Without it, a threshold call at `NORMAL` weight could take the slot and silently evict an equal- or lower-weight call already waiting there.
+- **In `where:`, the contract refuses while a caution is out.** For the gap calls the check goes in `gapWhereGates`, after the race-finished latch and before the overtake gate and the pure cooldown read. For the race status it goes beside the race-finished latch, together with `data.wasCaution === true`, written the way #1127's lap-time and position-change gates write it. The `where:` check does work the speak-time gate cannot: it keeps a caution-time fire out of the queue. Without it, a threshold call at `NORMAL` weight could take one of the queue's four places, and an arrival over that cap drops the lightest waiting call.
 - **In `speakGate`, the contract refuses while a caution is out.** This is the inverse of the caution family's own gate. The caution check must run before the existing claim, never after it. The gate is the one place a cooldown is claimed (#1137), and a claim followed by a refusal would burn the window for a call nobody heard.
   - The gap gate becomes `admit: (ctx) => !underCaution() && tryClaimGapCallout(ctx.now, cooldownMs())`. `gapSpeakGate` gains the resolver as a second parameter.
   - The race status gets its own gate: `!underCaution() && positionReadoutSpeakGate.admit(ctx)`. The shared gate itself is untouched, because the two overtake readouts use it too. When the caution check refuses, the shared gate's intro-decision stash is not taken. That is harmless: the stash is keyed to the fire that wrote it and read back only through the matching `ScenarioContext`, so a later fire cannot inherit it.
   - `wasCaution` is not asked at speak time. It is a fact about the completed lap, fixed when the event is emitted, so the `where:` has already answered it.
-- **Both checks are needed, as #1127 found for its own calls.** A `where:` alone lets a pre-throw fire drain into the caution. A `speakGate` alone lets a caution-time fire occupy the pending slot.
+- **Both checks are needed, as #1127 found for its own calls.** A `where:` alone lets a pre-throw fire drain into the caution. A `speakGate` alone lets a caution-time fire occupy a place in the queue.
 
 **One residual cannot be closed.** Suppose a fire already passed its gate and was playing when the caution came out. If an interrupting call then cuts it (a spotter proximity call, the meatball, fuel critical or a pit-box mark), it is stashed with `admitted: true`. It then replays whole without being asked again. Neither check reaches it. Only `queueable: false` would, and giving up queueing across the whole gap family would lose ordinary calls behind the spotter to cover a rare case. This is accepted, and the module headers say so as `caution.ts` does. The caution announcement itself does not interrupt, so a gap call already playing when the flag comes out finishes and the announcement follows. That is accepted too, since the call began under green.
 
 ## The translator: under a caution, the gap model is not racing
 
-`diffGaps` reads `state.cautionPhase` directly, since it runs inside the translator and needs no injected reader. It is the value `getCautionPhase()` and `getUnderFullCourseCaution` return to the callouts, so both halves of this change answer from one phase. Deriving it again from the flag bits would break #1127's rule of one derivation. The overtake diff's older bit test is left as it is.
+`diffGaps` takes the caution as the `underFullCourseCaution` parameter #1285 added, which the translator passes as `state.cautionPhase !== "none"`. It is the value `getCautionPhase()` and `getUnderFullCourseCaution` return to the callouts, so both halves of this change answer from one phase. Deriving it again from the flag bits would break #1127's rule of one derivation. The overtake diff's older bit test is left as it is.
 
-The tick order at #1127's HEAD puts `diffCaution` (`translator.ts:1952`) before `diffGaps` (`:2055`), so the phase `diffGaps` reads is the one the same tick settled. `diffGaps` only reads it, so it adds no new ordering constraint. `translator.test.ts` pins that order, and `state.ts`'s list of the phase's readers gains `diffGaps`.
+The translator runs `diffCaution` before `diffGaps`, so the phase `diffGaps` is handed is the one the same tick settled. `diffGaps` only reads it, so it adds no new ordering constraint. `translator.test.ts` pins that order, and `state.ts`'s list of the phase's readers gains `diffGaps`.
 
 While the phase is not `"none"`:
 
 - **The traces and the live gaps keep updating.** So Session Info's Gaps display and `getLiveGapBetween` behave exactly as they do today. The display rate chain is left alone too.
 - **Each side's callout bookkeeping is held at its reset value.** That covers the extremes, the contact latch, the breakaway latch, the threshold arming and the stability streak. Step 4 (`maybeEmitCalloutEvents`) does not run, so no `gap.*` event is emitted. `resetSideState` splits into its two halves for this, the rate chain and the callout bookkeeping. It keeps calling both where it does today: a neighbour change and a backwards jump.
-- **The opening-lap grid assumption extends to the restart.** On every caution tick the diff records the player's progress plus one lap, and `firstLap` holds while the player's progress is below that mark. After the green the mark stops moving, so the assumption covers exactly one lap of running from the restart. #933's reasoning carries over unchanged. A double-file restart puts the field nose-to-tail by construction. A neighbour that opens past the re-arm point and closes back is the field sorting itself out, not a catch. Without this, a restart lap could say "We've caught the car ahead" where a start lap never would.
+- **The opening-lap treatment extends to the restart.** On every caution tick the diff records the player's progress plus one lap, and the opening-lap predicate holds while the player's progress is below that mark. After the green the mark stops moving, so the treatment covers exactly one lap of running from the restart. It has two halves, and the one predicate carries both:
+  - *The grid assumption.* #933's reasoning carries over unchanged. A double-file restart puts the field nose-to-tail by construction. A neighbour that opens past the re-arm point and closes back is the field sorting itself out, not a catch. Without this, a restart lap could say "We've caught the car ahead" where a start lap never would.
+  - *No lap history* (#1285). The restart strings the field out as a start does, so a lap compared with the restart lap would call a breakaway or a catch that is only the restart unwinding. The restart lap is not recorded, and trend calls resume on the third lap under green, as they begin on lap 3 of a race.
 
 The bookkeeping is held for the whole caution, rather than reset once at the green, because holding needs no edge detection. The bookkeeping is empty at the green however the phase reached `"none"`: the green edge, the both-bits-clear expiry, or a withdrawn one-to-go. A replay glance that preserves the phase cannot desynchronise it either. The rate chain is not held because it forgets on its own. With α = 0.15 per 0.02-lap checkpoint, a sample's weight falls to about 9% within 0.3 lap. The one-to-go lap is a whole lap of steady formation before the green. What survives a caution is the bookkeeping, not the rate.
 
@@ -119,7 +138,7 @@ No setting is added. #1127 silenced lap-time and position-change unconditionally
   - No `gap.*` event while the phase is not `"none"`, while `getLiveGaps()` still updates.
   - The case the issue names: a peak recorded before the caution does not produce "gaining" on the first green lap.
   - A breakaway latch and a threshold arming from before the caution do not survive it.
-  - The restart lap applies the grid assumption, and the lap after it does not.
+  - The restart lap applies the grid assumption and records no lap history, and the lap after it does neither.
   - The rate chain is untouched under a caution.
 - `translator.test.ts`: pins `diffGaps` running after `diffCaution`, as #1127 pins its phase readers.
 
@@ -130,7 +149,7 @@ No setting is added. #1127 silenced lap-time and position-change unconditionally
 ## Documentation and artifacts
 
 - **Website Pit Crew page.** *What changes while a caution is out* gains the gap and status calls. The Gap callouts section's list of quiet moments and the race-status section each gain a clause. For the race status, the clause includes the lap the caution ends on.
-- **Changelog.** If #1127's caution line is still in the unreleased section, extend its sentence about calls that "stay quiet" instead of adding a line (`changelog.md`: a refinement of a listed capability edits that line). Otherwise it gets a line of its own.
+- **Changelog.** #1127's caution line has shipped in a dated release, so this change gets a fragment of its own in `changelog.d/` (#1386).
 - **Code comments.** Update the event-catalog doc comments for `gap.trendChanged` and `gap.thresholdCrossed`. The `lap.completed.wasCaution` comment names the callouts that refuse the lap, so it gains the race status. Also update the reader list on `cautionPhase` in `state.ts` and the `diff/gaps.ts` module header.
 - **`race-engineer-callout-examples.md`.** One entry with the reusable lesson: a caution voids a relevance model's bookkeeping, so the model is held at rest for the caution rather than gated only at the callout.
 - **`race-positions.md`.** No change.
