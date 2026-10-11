@@ -127,3 +127,26 @@ describe("camera-focus PI camera-group lists", () => {
     expect(section?.[0]).toContain('<option value="current">');
   });
 });
+
+describe("camera-focus PI Car Number field (#1353)", () => {
+  const field = template.match(/<sdpi-textfield[^>]*setting="carNumber"[^>]*>/)?.[0];
+
+  it("hands the field it declares to the shared digits-only filter", () => {
+    const id = field?.match(/id="([^"]+)"/)?.[1];
+
+    expect(id).toBeDefined();
+
+    const lookup = template.match(new RegExp(`var (\\w+) = document\\.getElementById\\("${id}"\\);`));
+
+    expect(lookup).not.toBeNull();
+    expect(template).toContain(`window.irdDigitsOnly(${lookup?.[1]})`);
+  });
+
+  it("limits the field to the four characters a raw number can have", () => {
+    expect(field).toContain('maxlength="4"');
+  });
+
+  it("filters nothing inline: the inner input is the shared filter's to rewrite", () => {
+    expect(template).not.toContain(".replace(/[^0-9]/g");
+  });
+});

@@ -75,6 +75,7 @@ import tvStaticSvg from "@iracedeck/icons/camera-select/tv-static.svg";
 import {
   getAllCarNumbers,
   getCameraGroupsFromSessionInfo,
+  getCarNumberRawByCarNumber,
   getCarNumberRawFromSessionInfo,
 } from "@iracedeck/iracing-sdk";
 import { getGlobalColors, getGlobalSettings, onGlobalSettingsChange } from "@iracedeck/settings";
@@ -319,6 +320,59 @@ export const CycleIconModeField = z.enum(["next", "current"]).default("next").ca
 /**
  * @internal Exported for testing
  *
+ * Reads a stored Switch by Car Number value as the digits the user typed,
+ * leading zeros kept (#1353). The field has always stored its text; until
+ * #1353 the schema coerced that text to an integer, which is where the zeros
+ * went. Digits are therefore kept exactly as stored. Any other stored value is
+ * read the way that schema read it — as a number, so `"7.0"` is still car 7
+ * rather than the car 70 its digits would spell — and what it refused, an
+ * empty field included, reads as `"0"`, the old default.
+ */
+export function normalizeCarNumber(value: unknown): string {
+  const stored = typeof value === "string" ? value.trim() : value;
+
+  if (typeof stored === "string" && /^[0-9]+$/.test(stored)) return stored;
+
+  const legacy = typeof stored === "string" || typeof stored === "number" ? Number(stored) : Number.NaN;
+
+  return Number.isSafeInteger(legacy) && legacy >= 0 ? String(legacy) : "0";
+}
+
+/**
+ * @internal Exported for testing
+ *
+ * Switch by Car Number's target, a digit string so `07` and `7` stay different
+ * cars (#1353). It cannot fail a parse, so an odd stored value never resets
+ * the key's mode. The PI stores digits only (`irdDigitsOnly`), which a build
+ * from before #1353 coerces back to an integer: a downgrade returns to the old
+ * behaviour rather than to a failed parse.
+ */
+export const CarNumberField = z.preprocess(normalizeCarNumber, z.string()).default("0");
+
+/**
+ * @internal Exported for testing
+ *
+ * The number a Switch by Car Number press sends for the parsed `carNumber`
+ * setting, or `null` to send nothing (#1353). iRacing's camera broadcast takes
+ * `CarNumberRaw`, which the session's roster states for every car, so the
+ * roster is asked first. A number without a leading zero that the roster does
+ * not list is sent as the integer it is — the raw number of such a car, and
+ * what the key sent before — which covers a roster that has not caught up. It
+ * is sent only up to four digits, the longest a raw number gets: the broadcast
+ * carries it in 16 bits, and a longer one would arrive as some other number.
+ * A number with a leading zero that the roster does not list is not sent.
+ */
+export function resolveSwitchCarNumberRaw(sessionInfo: unknown, carNumber: string): number | null {
+  const fromRoster = getCarNumberRawByCarNumber(sessionInfo, carNumber);
+
+  if (fromRoster !== null) return fromRoster;
+
+  return /^(0|[1-9][0-9]{0,3})$/.test(carNumber) ? Number(carNumber) : null;
+}
+
+/**
+ * @internal Exported for testing
+ *
  * The action's own settings fields, extended onto `CommonSettings` below —
  * exported so a test can parse through the real fields rather than a mock.
  */
@@ -329,7 +383,7 @@ export const CameraControlsSettingsFields = {
   cameraGroupSubset: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
   // Focus-specific
   position: z.coerce.number().int().min(1).default(1),
-  carNumber: z.coerce.number().int().min(0).default(0),
+  carNumber: CarNumberField,
   cameraState: z.coerce.number().int().min(0).default(0),
   // Cycle-camera-specific (#959): what a Cycle Camera key's icon shows.
   cycleIconMode: CycleIconModeField,
@@ -1237,9 +1291,17 @@ export class CameraControls extends SimIRacingAction<CameraControlsSettings> {
         break;
       }
       case "switch-by-car-number": {
-        const success = camera.switchNum(settings.carNumber, groupNum, cameraNum);
+        const carNumberRaw = resolveSwitchCarNumberRaw(this.sdkController.getSessionInfo(), settings.carNumber);
+
+        if (carNumberRaw === null) {
+          this.logger.info("Switch by car number skipped: car number not found in session info");
+          this.logger.debug(`carNumber: ${settings.carNumber}`);
+          break;
+        }
+
+        const success = camera.switchNum(carNumberRaw, groupNum, cameraNum);
         this.logger.info("Switch by car number executed");
-        this.logger.debug(`Result: ${success}, carNumber: ${settings.carNumber}`);
+        this.logger.debug(`Result: ${success}, carNumber: ${settings.carNumber}, carNumberRaw: ${carNumberRaw}`);
         break;
       }
       case "set-camera-state": {
