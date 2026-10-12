@@ -8,7 +8,7 @@ Replay Control gets a dial surface with two modes: **Speed Control** (#1316), a 
 
 ## The decision
 
-Replay Control becomes a dual-surface action, like Fuel Service and Replay Markers (#1230): one UUID, `["Keypad", "Encoder"]` on the Elgato manifest with a committed layout, `["Keypad", "Knob"]` on Mirabox (the manifest parity test requires both, `encoders-and-touchscreen.md` rule 7), Ulanzi `["Keypad"]`. The dial logic lives in `replay-control/replay-control-dial-surface.ts` behind a small host interface, and every handler branches on `ev.action.isDial()`.
+Replay Control becomes a dual-surface action, like Fuel Service and Replay Markers (#1230): one UUID, `["Keypad", "Encoder"]` on the Elgato manifest with a committed layout, `["Keypad", "Knob"]` on Mirabox (the manifest parity test requires both, `encoders-and-touchscreen.md` rule 7), Ulanzi `["Keypad"]`. The dial logic lives in `replay-control/replay-control-dial-surface.ts` behind a small host interface, and every handler branches on `ev.action.isDial()`. Each rotation mode is a module of its own behind the `ReplayDialMode` interface (`replay-control-dial-mode.ts`): the surface owns the per-context state, the in-replay guard, the gestures and the display, and a mode owns what a turn does and what the box reads. Both issues ship in one pull request.
 
 The action already carries `onDialDown` / `onDialRotate` with `executeDialDown` / `executeDialRotate`. They are unreachable: the manifests have declared the action keypad-only since #640. They are deleted with their tests, not adapted — they key the dial on the keypad's `mode`, which this design replaces with a dial-only `dial.mode`.
 
@@ -33,7 +33,7 @@ The gesture slots are shared by both modes, so switching the Mode select never c
 
 ## Rotation — Speed Control
 
-- **Read the live speed, not a cache.** The current speed is `ReplayPlaySpeed` / `ReplayPlaySlowMotion` from the latest telemetry, with the action's existing optimistic `setLocalSpeed` overlay so that two detents arriving before telemetry catches up do not compute from the same stale value. The Replay Markers dial needed a landing hold for exactly this, and this is that rule applied to speed.
+- **Read the live speed, not a cache.** The current speed is `ReplayPlaySpeed` / `ReplayPlaySlowMotion` from the latest telemetry, overlaid by a pending speed: after a dial send, a pause included, the live speed reads as the sent speed until telemetry reports it or 500 ms pass (`replay-speed-state.ts`), so that two detents arriving before telemetry catches up do not compute from the same stale value. The first design relied on the action's existing optimistic `setLocalSpeed` cache alone; the next telemetry tick overwrites that cache, and that tick can still carry the old speed (amended 2026-10-12, during implementation). The pending speed is one module-level value, because iRacing has one replay speed, and the surface still updates the action's cache so the keypad's speed icons follow at once. The Replay Markers dial needed a landing hold for exactly this, and this is that rule applied to speed.
 - **One stop per detent and `|ticks|` stops for a fast spin, with no per-event cap** (maintainer's call, 2026-10-04: someone will spin it like crazy). The only limit is rule 3's clamp at the ladder ends, without wrapping. A wrap from +8x to −8x would throw the replay backwards at full speed, which is the one surprise a speed dial must not give. One event sends **one** `setPlaySpeed`, to the last stop reached; at an end, nothing is sent.
 - **Off the ladder:** when the live speed is not a stop (a key set 3x, iRacing's own bar set 16x when 16 is not chosen), the first detent goes to the nearest stop strictly beyond it in the turn's direction. 3x clockwise is 4x, and 3x counter-clockwise is 2x.
 - **0x is a stop like any other.** Turning out of pause starts playback at the adjacent stop (¼x on the default ladder), never at the remembered speed: the ladder position is the replay's actual speed. Press is the route back to the remembered speed.
@@ -46,8 +46,8 @@ The gesture slots are shared by both modes, so switching the Mode select never c
 
 ## The remembered speed
 
-- **What it is:** the last non-zero speed the replay actually played at, as `{ speed, slowMotion }`. It is updated from telemetry on every tick where `ReplayPlaySpeed !== 0` and never overwritten by a 0, so it is right whoever changed the speed: the dial, a key, or iRacing's replay bar. Before any non-zero sample, it is 1x.
-- **Where it lives:** one module-level tracker in `replay-control/`, shared by both modes and every dial context, because iRacing has one replay speed. It is in memory only. A plugin restart resets it to 1x; persisting it would be a settings key for a value that is stale the moment the replay changes.
+- **What it is:** the last non-zero speed the replay actually played at, as `{ speed, slowMotion }`. It is updated from telemetry on every tick where `ReplayPlaySpeed !== 0` and never overwritten by a 0, so it is right whoever changed the speed: the dial, a key, or iRacing's replay bar. A non-zero speed the dial sends is recorded at once, so a turn and a pause inside one telemetry frame still resume the speed turned to. Before any non-zero sample, it is 1x.
+- **Where it lives:** one module-level tracker in `replay-control/` (`replay-speed-state.ts`), shared by both modes and every dial context, because iRacing has one replay speed. It is fed by the telemetry tick of every Replay Control context on screen, keys and dials alike, and only while a replay is on screen; a speed set while no Replay Control key or dial is visible is not seen (amended 2026-10-12). It is in memory only. A plugin restart resets it to 1x; persisting it would be a settings key for a value that is stale the moment the replay changes.
 - **Play/Pause:** a live speed other than 0 sends `pause()`, which the tracker has already recorded the speed for. 0x sends `setPlaySpeed(remembered)`.
 - **Set 1x and play** sends `setPlaySpeed(1, false)` whatever the state.
 - **Reverse direction** flips the sign of the live speed and keeps its magnitude and slow-motion flag. When paused, it flips the **remembered** speed and stays paused, so the next Play/Pause resumes the other way. The strip's resume caption shows the flip at once.
@@ -56,14 +56,14 @@ The gesture slots are shared by both modes, so switching the Mode select never c
 ## Commands and the replay cursor
 
 - **Every send, from either mode or any gesture, first calls `cancelReplayCursorOwner("dial-…")`**, exactly as the keypad's speed and transport modes do (they call `cancelFastestLapWalk`). A speed change in the middle of a Jump to Fastest Lap walk would make the walk misread its own probes. The dial never claims the cursor: every event is a one-shot command.
-- **Outside a replay, nothing is sent.** `IsReplayPlaying !== true` (which reads "in replay mode", not "playing", as `isCurrentlyPlaying` already notes) or missing telemetry makes rotation and every gesture a no-op, because iRacing ignores replay commands while driving.
+- **Outside a replay, nothing is sent.** "In a replay" is the controller's debounced replay state (`getReplayState().inReplay`, #1324) together with a telemetry tick; without both, rotation and every gesture are a no-op, because iRacing ignores replay commands while driving. Raw `IsReplayPlaying` is not read: it is false for about 300 ms after every seek, which would drop detents and blink the box dim after any marker or lap jump (amended 2026-10-12; the spec first named the raw flag).
 - **All of it is iRacing API; no binding is involved.** The dial gets its own `comms-catalog.ts` entry keyed on `dial.mode`, with the gesture-slot values in the same map (the existing dial entries' pattern), all `api`, then `pnpm generate:action-comms`.
 
 ## Press gestures
 
 Classified at release through `classifyDialReleaseForHost` with `getDualPressThresholdMs()`, as every dial does; no timer decides. On Mirabox every press is a short press (the adapter's atomic press, #1013).
 
-- **Hold preview (#1120), Elgato only.** The long-press outcome is knowable before release, so when the hold passes the threshold the strip shows it ("▶ 1x", "◀ 4x", "LIVE"). `onThreshold` returns `false` when the slot is None or the release would do nothing (not in a replay, no telemetry), and absent telemetry previews nothing rather than a default. The pending state goes into the render arguments and the displayed signature, and `up()` disarms before its early returns (the four traps in `encoders-and-touchscreen.md`).
+- **Hold preview (#1120), Elgato only.** The long-press outcome is knowable before release, so when the hold passes the threshold the strip shows it ("► 1x", "◄ 4x", "PAUSE", "LIVE"). `onThreshold` returns `false` when the slot is None or the release would do nothing (not in a replay, no telemetry), and absent telemetry previews nothing rather than a default. The pending state goes into the render arguments and the displayed signature, and `up()` disarms before its early returns (the four traps in `encoders-and-touchscreen.md`).
 - **Trigger descriptions** (Elgato) name the mode's rotation and the slot assignments, so the Stream Deck app's dial hint matches the settings.
 
 ## The display
@@ -74,10 +74,11 @@ Drawn through `dialCanvas()` / `setDialCanvas()` on every host, so the same code
 | --- | --- | --- |
 | Label | `SPEED` | `FRAME` |
 | Value | live speed, `formatSpeedDisplay` (`PAUSED`, `4x`, `-1/4x`) | `ReplaySessionTime` as `m:ss.ss` — at 60 frames a second, every frame changes the hundredths |
-| Caption | while paused: the resume speed, `▶ 4x` / `◀ 2x` | the play state, `PAUSED` or the live speed |
+| Caption | while paused: the resume speed, `► 4x` / `◄ 2x` | the play state, `PAUSED` or the live speed |
 | Side marks | lit when a turn that way would change the speed, dim at a ladder end | both lit in a replay |
 
-- **Not in a replay, or no telemetry:** the whole box dims, like the keypad's unavailable look.
+- **Not in a replay, or no telemetry:** the whole box dims, like the keypad's unavailable look, and shows the mode's label alone, with no hold preview.
+- **The direction marks are `►` / `◄` (U+25BA / U+25C4).** The look-alike `▶` / `◀` are missing from the bundled Arimo and rasterize as empty boxes on the Mirabox knob (amended 2026-10-12).
 - **Side marks on both sides:** `renderDialBox`'s `sideMarker` takes one side today. #1230 widens it to both, additively. Whichever of the two lands first does the widening, and the other reuses it.
 - **Cadence:** re-evaluated on each SDK tick. The dedupe signature is built from what is displayed (label, value, caption, side marks, pending), never the raw frame, so a paused Speed Control dial pushes nothing. A playing Frame Jog dial changes its value every tick and is throttled to at most 10 pushes per second per dial (rule 6).
 
