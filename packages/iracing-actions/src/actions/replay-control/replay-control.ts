@@ -12,9 +12,11 @@ import {
   ICON_BASE_TEMPLATE,
   type IDeckDialDownEvent,
   type IDeckDialRotateEvent,
+  type IDeckDialUpEvent,
   type IDeckDidReceiveSettingsEvent,
   type IDeckKeyDownEvent,
   type IDeckKeyUpEvent,
+  type IDeckTouchTapEvent,
   type IDeckWillAppearEvent,
   type IDeckWillDisappearEvent,
   parseSvgViewBox,
@@ -55,7 +57,6 @@ import speedDisplayIconSvg from "@iracedeck/icons/replay-control/speed-display.s
 import speedIncreaseIconSvg from "@iracedeck/icons/replay-control/speed-increase.svg";
 import stopIconSvg from "@iracedeck/icons/replay-control/stop.svg";
 import {
-  findNearestCarOnTrack,
   getAllCarNumbers,
   getCarNumberRawFromSessionInfo,
   ReplayPosMode,
@@ -90,6 +91,14 @@ import {
   STABILIZATION_POLL_INTERVAL_MS,
   STABILIZATION_TIMEOUT_MULTIPLIER,
 } from "../../shared/replay-timing.js";
+import { replayControlDialField } from "./replay-control-dial-settings.js";
+import { ReplayControlDialSurface } from "./replay-control-dial-surface.js";
+import { formatSpeedDisplay, parseSpeedSetting } from "./replay-speed-format.js";
+import { noteTelemetrySpeed } from "./replay-speed-state.js";
+
+// The speed text helpers moved to their own module so the dial surface shares
+// them (#1316); re-exported so this module's API is unchanged.
+export { formatSpeedDisplay, parseSpeedSetting } from "./replay-speed-format.js";
 
 const REPLAY_CONTROL_MODES = [
   "play-pause",
@@ -181,46 +190,6 @@ const REPLAY_CONTROL_TITLES: Record<ReplayControlMode, string> = {
   "prev-car": "CAR\nPREVIOUS",
   "next-car-number": "CAR #\nNEXT",
   "prev-car-number": "CAR #\nPREVIOUS",
-};
-
-/**
- * Which mode each detent of a rotation fires, for the modes that come in a
- * bidirectional pair. Keyed by the mode the key/dial is SET to; both members of
- * a pair map to the same two targets, so a dial behaves identically whichever
- * half of the pair it sits on.
- *
- * The fields name the physical gesture rather than the pair's "next" member on
- * purpose: most pairs read clockwise = next, but the car-number pair is
- * deliberately inverted (issue #973). On the number-primary controls a
- * clockwise detent makes the number on screen go DOWN — matching the Camera
- * Controls dial's Cycle by Car # and Cycle by Race Position modes (#884, #973)
- * — so one turn direction means the same thing across every control that
- * cycles BY a number.
- *
- * `next-car` / `prev-car` are NOT inverted: they tap iRacing's own Next /
- * Previous Car bindings (V / Shift-V by default), so the sim owns that ordering
- * and its "next" is not a number to shrink.
- *
- * The keypad is unaffected — a key dispatches `settings.mode` directly, so the
- * named modes ("CAR # NEXT" / "CAR # PREVIOUS") keep meaning what they say. So
- * does a dial PUSH (`executeDialDown`), which is deliberate but worth stating:
- * on a `next-car-number` dial the button walks UP the number order while a
- * clockwise turn walks DOWN it. The button keeps its printed meaning; only the
- * rotation follows the cross-action turn rule.
- */
-const DIRECTIONAL_PAIRS: Partial<
-  Record<ReplayControlMode, { clockwise: ReplayControlMode; counterClockwise: ReplayControlMode }>
-> = {
-  "next-session": { clockwise: "next-session", counterClockwise: "prev-session" },
-  "prev-session": { clockwise: "next-session", counterClockwise: "prev-session" },
-  "next-lap": { clockwise: "next-lap", counterClockwise: "prev-lap" },
-  "prev-lap": { clockwise: "next-lap", counterClockwise: "prev-lap" },
-  "next-incident": { clockwise: "next-incident", counterClockwise: "prev-incident" },
-  "prev-incident": { clockwise: "next-incident", counterClockwise: "prev-incident" },
-  "next-car": { clockwise: "next-car", counterClockwise: "prev-car" },
-  "prev-car": { clockwise: "next-car", counterClockwise: "prev-car" },
-  "next-car-number": { clockwise: "prev-car-number", counterClockwise: "next-car-number" },
-  "prev-car-number": { clockwise: "prev-car-number", counterClockwise: "next-car-number" },
 };
 
 /**
@@ -524,24 +493,6 @@ const SESSION_STRIDE = 10_000;
 /**
  * @internal Exported for testing
  *
- * Parses a speed setting value into speed and slowMotion flag.
- * Format: "1"-"16" for normal speeds, "s2"-"s16" for slow-motion (1/Nx).
- */
-export function parseSpeedSetting(value: string): { speed: number; slowMotion: boolean } {
-  if (value.startsWith("s")) {
-    const speed = parseInt(value.slice(1), 10);
-
-    return { speed: isNaN(speed) ? 2 : Math.max(2, Math.min(speed, 16)), slowMotion: true };
-  }
-
-  const speed = parseInt(value, 10);
-
-  return { speed: isNaN(speed) ? 1 : Math.max(1, Math.min(speed, 16)), slowMotion: false };
-}
-
-/**
- * @internal Exported for testing
- *
  * Calculates the gauge needle angle for a speed setting value.
  * Scale: 1/16x = -90°, 1x = 0°, 16x = 90°.
  */
@@ -552,23 +503,6 @@ export function calculateNeedleAngle(speedSetting: string): number {
   const position = slowMotion ? 16 - speed : 14 + speed;
 
   return ((position - 15) / 15) * 90;
-}
-
-/**
- * @internal Exported for testing
- *
- * Formats a speed value for display.
- */
-export function formatSpeedDisplay(speed: number, slowMotion: boolean): string {
-  if (speed === 0) return "PAUSED";
-
-  if (slowMotion && speed < 0) return `-1/${Math.abs(speed)}x`;
-
-  if (slowMotion) return `1/${Math.abs(speed)}x`;
-
-  if (speed < 0) return `${speed}x`;
-
-  return `${speed}x`;
 }
 
 /**
@@ -722,18 +656,6 @@ export function generateReplayControlSvg(
 /**
  * @internal Exported for testing
  *
- * Find the physically closest car ahead or behind the currently viewed car (CamCarIdx).
- * Delegates to the shared findNearestCarOnTrack from @iracedeck/iracing-sdk.
- */
-export function findAdjacentCarOnTrack(telemetry: TelemetryData | null, direction: "ahead" | "behind"): number | null {
-  const camCarIdx = (telemetry?.CamCarIdx as number) ?? -1;
-
-  return findNearestCarOnTrack(telemetry, camCarIdx, direction);
-}
-
-/**
- * @internal Exported for testing
- *
  * Resolves a car's fastest lap number for the **current replay session**,
  * preferring `SessionInfo.Sessions[].ResultsPositions[].FastestLap` over
  * live telemetry. `ResultsPositions` is the authoritative post-session
@@ -847,6 +769,7 @@ const ReplayControlSettings = CommonSettings.extend({
   speed: z.string().default("1"),
   stepRate: z.coerce.number().int().min(1).max(15).default(1),
   fastestLapTarget: z.enum(["viewed-car", "always-my-car"]).default("viewed-car"),
+  dial: replayControlDialField,
 });
 
 type ReplayControlSettings = z.infer<typeof ReplayControlSettings>;
@@ -855,7 +778,8 @@ type ReplayControlSettings = z.infer<typeof ReplayControlSettings>;
  * Replay Control
  * Unified replay action combining transport, speed, and navigation controls.
  * Provides progressive speed control for fast-forward, rewind, and slow-motion
- * with telemetry-driven display.
+ * with telemetry-driven display. Since #1316 the action is dual-surface: a dial
+ * instance routes every event to {@link ReplayControlDialSurface}.
  */
 export const REPLAY_CONTROL_UUID = "com.iracedeck.sd.core.replay-control" as const;
 
@@ -896,9 +820,40 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
   /** Last rendered state key per context (prevents redundant re-renders) */
   private lastState = new Map<string, string>();
 
+  /** The dial half of the action (#1316); every dial event routes here. */
+  private readonly dialSurface = new ReplayControlDialSurface({
+    logger: this.logger,
+    // The controller's debounced state (#1324): raw `IsReplayPlaying` reads
+    // false for ~300 ms after every seek, which would drop detents after one.
+    inReplay: () => this.sdkController.getReplayState().inReplay,
+    // A fresh read every time, never the last tick delivered: a subscriber is
+    // told only when `SessionTick` advances, and a paused or scrubbed replay
+    // changes without it. The surface takes one per entry; a tick brings its own.
+    telemetry: () => this.sdkController.getCurrentTelemetry(),
+    setLocalSpeed: (speed, slowMotion) => this.setLocalSpeed(speed, slowMotion),
+    // The keypad's own Jump to Live, cursor take and replay-state note included.
+    jumpToLive: () => this.executeMode("__dial__", this.parseSettings({ mode: "jump-to-live" })),
+    refreshKeys: () => this.updateAllTelemetryDisplays(),
+  });
+
   override async onWillAppear(ev: IDeckWillAppearEvent<ReplayControlSettings>): Promise<void> {
     await super.onWillAppear(ev);
     const settings = this.parseSettings(ev.payload.settings);
+
+    if (ev.action.isDial()) {
+      const contextId = ev.action.id;
+
+      await this.dialSurface.willAppear(ev.action, settings.dial);
+      // A dial joins the speed cache and the telemetry subscription, but never
+      // the key contexts: it has no key icon and no binding.
+      this.seedTelemetryState(contextId, this.sdkController.getCurrentTelemetry());
+      this.sdkController.subscribe(contextId, (telemetry: TelemetryData | null) =>
+        this.onDialTelemetry(contextId, telemetry),
+      );
+
+      return;
+    }
+
     this.activeContexts.set(ev.action.id, settings);
     this.setActiveBinding(KEYSTROKE_MODES[settings.mode] ?? null);
 
@@ -915,6 +870,7 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
 
       const prevStateKey = this.buildTelemetryStateKey(ev.action.id);
       this.updateTelemetryState(ev.action.id, telemetry);
+      this.rememberReplaySpeed(telemetry);
       const newStateKey = this.buildTelemetryStateKey(ev.action.id);
 
       const storedSettings = this.activeContexts.get(ev.action.id);
@@ -933,6 +889,7 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
 
   override async onWillDisappear(ev: IDeckWillDisappearEvent<ReplayControlSettings>): Promise<void> {
     this.repeat.clear(ev.action.id);
+    this.dialSurface.willDisappear(ev.action.id);
     await super.onWillDisappear(ev);
     this.sdkController.unsubscribe(ev.action.id);
     this.replaySpeed.delete(ev.action.id);
@@ -946,6 +903,13 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     // Settings can change mid-hold; drop any pending repeat and held state.
     this.repeat.clear(ev.action.id);
     const settings = this.parseSettings(ev.payload.settings);
+
+    if (ev.action.isDial()) {
+      await this.dialSurface.didReceiveSettings(ev.action, settings.dial);
+
+      return;
+    }
+
     this.activeContexts.set(ev.action.id, settings);
     this.setActiveBinding(KEYSTROKE_MODES[settings.mode] ?? null);
     await this.updateDisplay(ev, settings);
@@ -975,15 +939,63 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
   }
 
   override async onDialDown(ev: IDeckDialDownEvent<ReplayControlSettings>): Promise<void> {
-    this.logger.info("Dial down received");
     const settings = this.parseSettings(ev.payload.settings);
-    this.executeDialDown(ev.action.id, settings);
+    this.dialSurface.down(ev.action, settings.dial);
   }
 
   override async onDialRotate(ev: IDeckDialRotateEvent<ReplayControlSettings>): Promise<void> {
-    this.logger.info("Dial rotated");
     const settings = this.parseSettings(ev.payload.settings);
-    this.executeDialRotate(ev.action.id, settings.mode, ev.payload.ticks);
+    this.dialSurface.rotate(ev.action, settings.dial, ev.payload.ticks, ev.payload.pressed === true);
+  }
+
+  override async onDialUp(ev: IDeckDialUpEvent<ReplayControlSettings>): Promise<void> {
+    await this.dialSurface.up(ev.action.id);
+  }
+
+  override async onTouchTap(ev: IDeckTouchTapEvent<ReplayControlSettings>): Promise<void> {
+    const settings = this.parseSettings(ev.payload.settings);
+    this.dialSurface.touchTap(ev.action, settings.dial, ev.payload.hold === true);
+  }
+
+  /**
+   * One telemetry tick for a dial context. Its replay speed is decoded once
+   * for all three uses: the shared speed cache, the speed Play/Pause resumes,
+   * and the dial's own screen, which is handed the tick so comparing its frame
+   * costs no telemetry read and redraws only on a change.
+   */
+  private onDialTelemetry(contextId: string, telemetry: TelemetryData | null): void {
+    // As for a key: a disconnect is the one signal that the replay the
+    // fastest-lap map described is gone, and a page of dials alone must not
+    // miss it.
+    if (telemetry === null) cachedFastestLapSessionMap = null;
+
+    const speed = telemetry ? replaySpeedFromTelemetry(telemetry) : null;
+
+    // The keypad's `updateTelemetryState`, from the speed already decoded: no
+    // telemetry reads as paused, and a tick with no speed leaves the cache.
+    if (!telemetry || speed) {
+      this.replaySpeed.set(contextId, speed?.speed ?? 0);
+      this.replaySlowMotion.set(contextId, speed?.slowMotion ?? false);
+    }
+
+    this.rememberReplaySpeed(telemetry, speed);
+    this.dialSurface.onTick(contextId, { telemetry, speed });
+  }
+
+  /**
+   * Feeds one tick to the speed the dial's Play/Pause resumes
+   * (`replay-speed-state.ts`). Every context of this action calls it, keys
+   * included, so a speed set and paused while only keys are on the page is
+   * remembered when a dial's page comes back. Only while a replay is on
+   * screen: out of one, `ReplayPlaySpeed` says nothing about a replay. A speed
+   * set while no Replay Control context is visible at all is still not seen.
+   * `current` is the tick's speed where the caller has already decoded it.
+   */
+  private rememberReplaySpeed(
+    telemetry: TelemetryData | null,
+    current = telemetry ? replaySpeedFromTelemetry(telemetry) : null,
+  ): void {
+    if (current && this.sdkController.getReplayState().inReplay) noteTelemetrySpeed(current, Date.now());
   }
 
   /**
@@ -1093,12 +1105,6 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     const sessionInfo = this.sdkController.getSessionInfo();
 
     return getCarNumberRawFromSessionInfo(sessionInfo, carIdx);
-  }
-
-  private findAdjacentCarOnTrack(direction: "ahead" | "behind"): number | null {
-    const telemetry = this.sdkController.getCurrentTelemetry();
-
-    return findAdjacentCarOnTrack(telemetry, direction);
   }
 
   /**
@@ -2494,124 +2500,6 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     // Re-render all telemetry-driven buttons (play-pause, play-backward, speed-display)
     // so cross-button state stays in sync (e.g., pressing play-backward updates the play-pause icon)
     this.updateAllTelemetryDisplays();
-  }
-
-  private executeDialDown(contextId: string, settings: ReplayControlSettings): void {
-    const replay = getCommands().replay;
-    const { mode } = settings;
-
-    if (mode === "speed-increase" || mode === "speed-decrease") {
-      // Speed modes: encoder push resets to normal speed
-      this.cancelFastestLapWalk(mode);
-      const success = replay.play();
-      this.setLocalSpeed(1, false);
-      this.logger.info("Speed reset to normal");
-      this.logger.debug(`Result: ${success}`);
-      this.updateAllTelemetryDisplays();
-    } else if (mode === "play-pause" || mode === "play-backward") {
-      this.executeMode(contextId, settings);
-    } else if (mode === "set-speed") {
-      this.executeMode(contextId, settings);
-    } else if (mode === "speed-display") {
-      // No action for speed display
-    } else if (DIRECTIONAL_PAIRS[mode]) {
-      this.executeMode(contextId, settings);
-    } else if (mode === "jump-to-beginning" || mode === "jump-to-live") {
-      this.executeMode(contextId, settings);
-    } else if (mode === "jump-to-my-car") {
-      this.executeMode(contextId, settings);
-    } else if (mode === "jump-to-fastest-lap") {
-      // Single-shot jump — no meaningful encoder push semantic.
-    } else {
-      // Transport modes: encoder push plays
-      this.cancelFastestLapWalk(mode);
-      const success = replay.play();
-      this.setLocalSpeed(1, false);
-      this.logger.info("Play executed (dial)");
-      this.logger.debug(`Result: ${success}`);
-      this.updateAllTelemetryDisplays();
-    }
-  }
-
-  private executeDialRotate(contextId: string, mode: ReplayControlMode, ticks: number): void {
-    // A zero-tick rotate carries no direction; every branch below reads
-    // `ticks > 0` as clockwise and anything else as counter-clockwise, so
-    // without this guard a 0 would silently dispatch the counter-clockwise
-    // half (the same guard the camera dial surface applies).
-    if (ticks === 0) return;
-
-    const replay = getCommands().replay;
-
-    if (mode === "jump-to-fastest-lap") {
-      // Single-shot jump — rotation has no meaningful semantic.
-      return;
-    }
-
-    if (mode === "speed-increase" || mode === "speed-decrease") {
-      // Speed modes: rotate adjusts speed progressively
-      const adjustedMode: ReplayControlMode = ticks > 0 ? "speed-increase" : "speed-decrease";
-      this.executeMode(contextId, {
-        mode: adjustedMode,
-        speed: "1",
-        stepRate: 1,
-        fastestLapTarget: "viewed-car",
-        flagsOverlay: false,
-        addedWithVersion: "0.0.0",
-      });
-    } else if (DIRECTIONAL_PAIRS[mode]) {
-      const pair = DIRECTIONAL_PAIRS[mode]!;
-      const nav = ticks > 0 ? pair.clockwise : pair.counterClockwise;
-      this.executeMode("__dial__", {
-        mode: nav,
-        speed: "1",
-        stepRate: 1,
-        fastestLapTarget: "viewed-car",
-        flagsOverlay: false,
-        addedWithVersion: "0.0.0",
-      });
-    } else if (mode === "jump-to-beginning" || mode === "jump-to-live") {
-      this.cancelFastestLapWalk(mode);
-
-      if (ticks > 0) {
-        replay.nextIncident();
-        this.logger.info("Next incident (dial)");
-      } else {
-        replay.prevIncident();
-        this.logger.info("Previous incident (dial)");
-      }
-    } else if (mode === "jump-to-my-car") {
-      // Rotate cycles next/prev car on track. A camera switch mid-walk would
-      // point iRacing's camera-relative lap-search at another car, so it
-      // cancels the walk like a cursor command does.
-      this.cancelFastestLapWalk(mode);
-      const direction = ticks > 0 ? "ahead" : "behind";
-      const carIdx = this.findAdjacentCarOnTrack(direction);
-
-      if (carIdx === null) {
-        this.logger.warn("No adjacent car found on track (dial)");
-      } else {
-        const carNum = this.getCarNumberRawByIdx(carIdx);
-
-        if (carNum === null) {
-          this.logger.warn("Could not find car number for adjacent car (dial)");
-        } else {
-          const camera = getCommands().camera;
-          camera.switchNum(carNum, 0, 0);
-          this.logger.info(ticks > 0 ? "Next car (dial)" : "Previous car (dial)");
-        }
-      }
-    } else {
-      // Transport modes: rotate does frame step
-      this.cancelFastestLapWalk(mode);
-
-      if (ticks > 0) {
-        replay.nextFrame();
-        this.logger.info("Frame forward (dial)");
-      } else {
-        replay.prevFrame();
-        this.logger.info("Frame backward (dial)");
-      }
-    }
   }
 
   private async updateDisplay(
