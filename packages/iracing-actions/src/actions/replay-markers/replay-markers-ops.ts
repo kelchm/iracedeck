@@ -1,13 +1,24 @@
 /**
  * What a Replay Markers press does, shared by the keypad (#1162) and the dial
- * (#1230): reading the replay context, Add, Delete, and where a Next /
- * Previous jump lands. Both surfaces call these functions rather than each
- * deriving its own, which is what keeps a turn of the dial and a key press
- * landing on the same marker, and the dial's side marks agreeing with the
- * keypad's greyed keys. Logging stays with the callers.
+ * (#1230): reading the replay context, Add, Delete, where a Next / Previous
+ * jump lands, and the jump itself. Both surfaces call these functions rather
+ * than each deriving its own, which is what keeps a turn of the dial and a key
+ * press landing on the same marker, and the dial's side marks agreeing with
+ * the keypad's greyed keys.
+ *
+ * A jump is the shared replay jump sequence (`shared/replay-jump-playback.ts`,
+ * #1276): it pauses a moving replay, seeks, waits for the landing and then
+ * leaves the replay the way the Replay jump playback setting says. So it
+ * outlives the press that started it, and {@link jumpToMarkerFrame} returns a
+ * promise of how it ended.
+ *
+ * Logging stays with the callers: nothing here keeps a logger. The surface
+ * that was pressed hands its own to {@link followMarkerJump}, which writes how
+ * the jump ended in the wording every replay jump shares.
  */
 import { getCommands } from "@iracedeck/deck-iracing";
-import { REPLAY_EXIT_GRACE_MS, ReplayPosMode, type ReplayState, type TelemetryData } from "@iracedeck/iracing-sdk";
+import { REPLAY_EXIT_GRACE_MS, type ReplayState, type TelemetryData } from "@iracedeck/iracing-sdk";
+import type { ILogger } from "@iracedeck/logger";
 import {
   MARKER_DEDUPE_FRAMES,
   MARKER_DELETE_WINDOW_FRAMES,
@@ -18,12 +29,18 @@ import {
 } from "@iracedeck/replay-store";
 
 import {
-  cancelReplayCursorOwner,
   clearReplayLanding,
+  currentReplayCursorOwner,
   pendingReplayLanding,
   recordReplayLanding,
   type ReplayLanding,
 } from "../../shared/replay-cursor.js";
+import {
+  beginReplayJump,
+  describeReplayJump,
+  type ReplayJumpOutcome,
+  runReplayJump,
+} from "../../shared/replay-jump-playback.js";
 
 /** Replay frames per second — the recording's fixed rate. */
 const FRAMES_PER_SECOND = 60;
@@ -38,10 +55,14 @@ export const CONFIRMATION_FLASH_MS = 1_000;
 /**
  * @internal Exported for testing
  *
- * How long (ms) after a marker jump the next one is measured from the marker
- * jumped to rather than from the live frame. `ReplayFrameNum` reaches the
- * target only on a later tick, so a second jump arriving first would compute
- * from the old frame and send the same marker again — a fast spin would stick.
+ * How long (ms) after a marker jump was pressed the next one is measured from
+ * the marker jumped to rather than from the live frame, once that jump is no
+ * longer running. `ReplayFrameNum` reaches the target only later — the seek
+ * waits for a moving replay to pause, and takes iRacing however long it takes —
+ * so a second jump arriving first would compute from the old frame and send
+ * the same marker again: a fast spin would stick. While the jump is still
+ * running its marker anchors whatever the clock says; the hold covers the
+ * read or two after it has ended.
  */
 export const DIAL_LANDING_HOLD_MS = 1_000;
 
@@ -284,8 +305,9 @@ export function markerIndexAt(markers: readonly ReplayMarker[], frame: number): 
  * @internal Exported for testing
  *
  * The frame the next jump is measured from: the marker last jumped to while the
- * jump is pending — sent less than {@link DIAL_LANDING_HOLD_MS} ago and the live
- * frame not yet within a second of it — else the live frame.
+ * jump is pending — still running, or pressed less than
+ * {@link DIAL_LANDING_HOLD_MS} ago, and the live frame not yet within a second
+ * of it — else the live frame.
  */
 export function resolveAnchorFrame(landing: ReplayLanding | null, liveFrame: number, nowMs: number): number {
   if (landing === null || isLandingSettled(landing, liveFrame, nowMs)) return liveFrame;
@@ -294,7 +316,15 @@ export function resolveAnchorFrame(landing: ReplayLanding | null, liveFrame: num
 }
 
 function isLandingSettled(landing: ReplayLanding, liveFrame: number, nowMs: number): boolean {
-  return nowMs - landing.sentAt >= DIAL_LANDING_HOLD_MS || Math.abs(liveFrame - landing.frame) <= LANDED_WITHIN_FRAMES;
+  if (Math.abs(liveFrame - landing.frame) <= LANDED_WITHIN_FRAMES) return true;
+
+  // A claim standing beside a landing is the jump that recorded it: anything
+  // else that takes the cursor clears the landing. Until that jump ends the
+  // replay is headed for its marker, and the live frame is not a position —
+  // iRacing reads 0 while it seeks — however long the seek takes.
+  if (currentReplayCursorOwner() !== null) return false;
+
+  return nowMs - landing.sentAt >= DIAL_LANDING_HOLD_MS;
 }
 
 /**
@@ -363,27 +393,81 @@ export function deleteMarkerAt(context: ReplayContext): ReplayMarker | null {
 }
 
 /**
- * Jumps the replay to `frame` with one `setPlayPosition(Begin, frame)`. First
- * cancels any claim on the replay cursor (#1203) in `owner`'s name, so a jump
- * stops an in-flight Jump to Fastest Lap walk rather than being overridden by
- * its next probe. A jump that was sent records `frame` as the shared landing
- * the next jump, from any Replay Markers surface, measures from (#1230). One
- * that was not sent moved nothing, so the landing before it stands. Call it
- * only when a jump is meant to be sent.
+ * Jumps the replay to `frame` with the shared jump sequence and resolves with
+ * how it ended. The replay finishes the way the Replay jump playback setting
+ * says: `readTelemetry` is read at the press for the speed to restore, then
+ * polled while the sequence waits for the pause and for the landing. Call it
+ * only when a jump is meant to be sent, and read the anchor
+ * ({@link resolveMarkerJumpAnchor}) first: the claim below clears the landing.
+ *
+ * Everything up to the sequence's first wait happens within the call:
+ *
+ * 1. The replay cursor is claimed in `owner`'s name (#1203). That stops an
+ *    in-flight Jump to Fastest Lap walk, or an earlier marker jump — whose
+ *    captured speed this one inherits — rather than racing it.
+ * 2. `frame` is recorded as the shared landing the next jump, from any Replay
+ *    Markers surface, measures from (#1230). At the press, not at the seek: a
+ *    moving replay is paused first, so its seek goes out a poll or more later,
+ *    and a dial detent arriving in between must already step on from here.
+ * 3. A replay that is paused, and was before the press, gets its seek at once.
+ *
+ * A jump that stopped short, or threw, clears the landing it recorded if that
+ * landing is still its own, whatever the reason: the replay is not known to be
+ * headed there, so the next jump measures from the live frame. A jump that
+ * landed or was cancelled touches nothing — the anchor rule settles a landing
+ * the replay reached, and whoever took the cursor has already cleared or
+ * replaced the other.
  */
-export function jumpToMarkerFrame(owner: string, frame: number, nowMs: number = Date.now()): boolean {
-  const before = pendingReplayLanding();
+export async function jumpToMarkerFrame(
+  owner: string,
+  frame: number,
+  readTelemetry: () => TelemetryData | null,
+  nowMs: number = Date.now(),
+): Promise<ReplayJumpOutcome> {
+  // Before the claim: a throw here leaves the cursor and the landing as they were.
+  const replay = getCommands().replay;
+  const jump = beginReplayJump(owner, readTelemetry(), undefined, nowMs);
+  // The record itself: identity tells this jump's landing from a later one's, even one to the same frame.
+  const own = recordReplayLanding(frame, nowMs);
+  const dropOwnLanding = (): void => {
+    if (pendingReplayLanding() === own) clearReplayLanding();
+  };
 
-  // Clears the landing too: the cursor is taken, and this send decides where it goes.
-  cancelReplayCursorOwner(owner);
+  try {
+    const outcome = await runReplayJump(jump, { frame, replay, readTelemetry });
 
-  const sent = getCommands().replay.setPlayPosition(ReplayPosMode.Begin, frame);
+    if (outcome.kind === "stopped") dropOwnLanding();
 
-  if (sent) {
-    recordReplayLanding(frame, nowMs);
-  } else if (before !== null) {
-    recordReplayLanding(before.frame, before.sentAt);
+    return outcome;
+  } catch (err) {
+    dropOwnLanding();
+
+    throw err;
+  } finally {
+    jump.end();
   }
+}
 
-  return sent;
+/**
+ * Logs how a marker jump ended once it has, through the surface's own logger:
+ * a warning when something went wrong, and the details at debug either way,
+ * each led by `what` (the surface's name for the jump). Nothing waits on a
+ * jump, so a rejection is caught here and logged as an error.
+ */
+export function followMarkerJump(
+  logger: Pick<ILogger, "debug" | "warn" | "error">,
+  what: string,
+  frame: number,
+  jump: Promise<ReplayJumpOutcome>,
+): void {
+  void jump.then(
+    (outcome) => {
+      const report = describeReplayJump(outcome, frame);
+
+      if (report.warn !== null) logger.warn(`${what}: ${report.warn}`);
+
+      logger.debug(`${what}: ${report.detail}`);
+    },
+    (err: unknown) => logger.error(`${what}: jump failed: ${String(err)}`),
+  );
 }

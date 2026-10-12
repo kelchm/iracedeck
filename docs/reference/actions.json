@@ -421,7 +421,7 @@
               "value": "jump-to-fastest-lap",
               "label": "Jump to Fastest Lap",
               "additionalSettings": ["fastestLapTarget"],
-              "description": "Jump the replay to the fastest lap of either the viewed car or always your own car: looked up in the lap record iRaceDeck keeps live (lands about 1 s before the line and plays), falling back to a replay search when the lap was not recorded (session-scoped; no dial support)"
+              "description": "Jump the replay to the fastest lap of either the viewed car or always your own car: looked up in the lap record iRaceDeck keeps live (lands about 1 s before the line, then keeps, starts or stops playback as the Replay jump playback global setting says), falling back to a replay search when the lap was not recorded (session-scoped; no dial support)"
             },
             { "value": "next-car", "label": "Next Car" },
             { "value": "prev-car", "label": "Previous Car" },
@@ -458,12 +458,12 @@
             {
               "value": "next",
               "label": "Next Marker",
-              "description": "Jump the replay to the next marker more than 1 s ahead; replay only, sends nothing from the car"
+              "description": "Jump the replay to the next marker more than 1 s ahead, pausing a moving replay for the jump and then keeping, starting or stopping playback as the Replay jump playback global setting says; replay only, sends nothing from the car"
             },
             {
               "value": "previous",
               "label": "Previous Marker",
-              "description": "Jump the replay to the previous marker, or to the one before it while a marker's first 2 s are playing; replay only, sends nothing from the car"
+              "description": "Jump the replay to the previous marker, or to the one before it while a marker's first 2 s are playing, with the same pause and Replay jump playback ending as Next Marker; replay only, sends nothing from the car"
             }
           ]
         },

@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { _resetReplayCursor, cancelReplayCursorOwner, claimReplayCursor } from "./replay-cursor.js";
-import { isLandedOn, isPaused, type ReplaySeekSample, seekReplayFrame, waitForReplay } from "./replay-seek.js";
+import {
+  isLandedOn,
+  isPaused,
+  isSeeking,
+  type ReplaySeekSample,
+  seekReplayFrame,
+  waitForReplay,
+} from "./replay-seek.js";
 
 describe("replay-seek", () => {
   beforeEach(() => {
@@ -36,6 +43,20 @@ describe("replay-seek", () => {
       expect(isPaused({ ReplayPlaySpeed: -8 })).toBe(false);
       expect(isPaused({})).toBe(false);
       expect(isPaused(null)).toBe(false);
+    });
+  });
+
+  describe("isSeeking", () => {
+    it("is a sample with no replay on screen and nobody driving", () => {
+      expect(isSeeking({ IsReplayPlaying: false, ReplayFrameNum: 0 })).toBe(true);
+      expect(isSeeking({ IsReplayPlaying: false, IsOnTrack: false })).toBe(true);
+    });
+
+    it("is not a replay on screen, a driver on track, or a sample that does not say", () => {
+      expect(isSeeking({ IsReplayPlaying: true, ReplayFrameNum: 0 })).toBe(false);
+      expect(isSeeking({ IsReplayPlaying: false, IsOnTrack: true })).toBe(false);
+      expect(isSeeking({ ReplayFrameNum: 0 })).toBe(false);
+      expect(isSeeking(null)).toBe(false);
     });
   });
 
@@ -149,6 +170,128 @@ describe("replay-seek", () => {
         seekReplayFrame({ frame: 64_401, claim, send, readTelemetry, timeoutMs: 1600, pollMs: 50 }),
       ).resolves.toEqual({ kind: "cancelled", by: "play-pause" });
       expect(send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("waiting out a seek that shows (#1276)", () => {
+    it("does not run the timeout while a read shows the seek, and runs it once none does", async () => {
+      const sample: ReplaySeekSample = { ReplayFrameNum: 0, IsReplayPlaying: false };
+      const claim = claimReplayCursor("test jump");
+      let outcome: string | null = null;
+
+      void waitForReplay(
+        { claim, readTelemetry: () => ({ ...sample }), timeoutMs: 1000, pollMs: 50, seeking: isSeeking },
+        (s): s is ReplaySeekSample => isLandedOn(s, 5_000, false),
+      ).then((result) => (outcome = result.kind));
+
+      // A flat frame for five timeouts' worth of waiting.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(outcome).toBeNull();
+
+      // The seek ends short of the frame: one timeout after the last read that showed it.
+      sample.IsReplayPlaying = true;
+      sample.ReplayFrameNum = 4_000;
+      await vi.advanceTimersByTimeAsync(900);
+      expect(outcome).toBeNull();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(outcome).toBe("timeout");
+    });
+
+    it("without seeking, gives up at the timeout whatever the sample reads", async () => {
+      const claim = claimReplayCursor("test jump");
+      let outcome: string | null = null;
+
+      void waitForReplay(
+        {
+          claim,
+          readTelemetry: (): ReplaySeekSample => ({ ReplayFrameNum: 0, IsReplayPlaying: false }),
+          timeoutMs: 1000,
+          pollMs: 50,
+        },
+        (s): s is ReplaySeekSample => isLandedOn(s, 5_000, false),
+      ).then((result) => (outcome = result.kind));
+
+      await vi.advanceTimersByTimeAsync(900);
+      expect(outcome).toBeNull();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(outcome).toBe("timeout");
+    });
+
+    it("stops at maxWaitMs while the seek still shows", async () => {
+      const claim = claimReplayCursor("test jump");
+      let outcome: string | null = null;
+
+      void waitForReplay(
+        {
+          claim,
+          readTelemetry: (): ReplaySeekSample => ({ ReplayFrameNum: 0, IsReplayPlaying: false }),
+          timeoutMs: 1000,
+          pollMs: 50,
+          seeking: isSeeking,
+          maxWaitMs: 5000,
+        },
+        (s): s is ReplaySeekSample => isLandedOn(s, 5_000, false),
+      ).then((result) => (outcome = result.kind));
+
+      await vi.advanceTimersByTimeAsync(4900);
+      expect(outcome).toBeNull();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(outcome).toBe("timeout");
+    });
+
+    it("with requireReplay, the frame sent is no landing while no replay is on screen", async () => {
+      // A jump to frame 0: the seek under way reads 0 too.
+      const sample: ReplaySeekSample = { ReplayFrameNum: 0, IsReplayPlaying: false };
+      const claim = claimReplayCursor("test jump");
+      let outcome: string | null = null;
+
+      void seekReplayFrame({
+        frame: 0,
+        claim,
+        send: () => true,
+        readTelemetry: () => ({ ...sample }),
+        timeoutMs: 1000,
+        pollMs: 50,
+        requireSession: false,
+        requireReplay: true,
+        seeking: isSeeking,
+      }).then((result) => (outcome = result.kind));
+
+      await vi.advanceTimersByTimeAsync(400);
+      expect(outcome).toBeNull();
+
+      sample.IsReplayPlaying = true;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(outcome).toBe("reached");
+    });
+
+    it("without requireReplay, the frame alone lands it", async () => {
+      const claim = claimReplayCursor("test jump");
+
+      const result = seekReplayFrame({
+        frame: 0,
+        claim,
+        send: () => true,
+        readTelemetry: (): ReplaySeekSample => ({ ReplayFrameNum: 0, IsReplayPlaying: false }),
+        timeoutMs: 1000,
+        pollMs: 50,
+        requireSession: false,
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(result).resolves.toMatchObject({ kind: "reached" });
+    });
+  });
+
+  describe("a refused jump (#1276)", () => {
+    it("resolves refused at once, without waiting for a landing that is not coming", async () => {
+      const claim = claimReplayCursor("test jump");
+      const readTelemetry = vi.fn(() => ({ ReplayFrameNum: 90_000, SessionNum: 0 }));
+
+      await expect(
+        seekReplayFrame({ frame: 64_401, claim, send: () => false, readTelemetry, timeoutMs: 1600, pollMs: 50 }),
+      ).resolves.toEqual({ kind: "refused" });
+      expect(readTelemetry).not.toHaveBeenCalled();
     });
   });
 });
