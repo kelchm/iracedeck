@@ -1,0 +1,147 @@
+# Replay record steps: lap and session jumps from the record, session starts and incidents recorded
+
+> **Issue:** [#1426](https://github.com/niklam/iracedeck/issues/1426) · **Supersedes:** _none_ · **Superseded by:** _none_
+>
+> Point-in-time design record. The code and `.claude/rules/` are the truth; this is not documentation.
+
+Split out of #801, whose dial modes are built on this. It builds on the per-session replay store (#1162), the lap record (#1203), the green record's recorder seam (#1354) and the shared jump sequence (#1276), and restates none of them.
+
+## The decision
+
+1. **Next / Previous Lap and Next / Previous Session jump from the record.** The press finds its target among the frames iRaceDeck recorded and makes one waited jump there. A step the record cannot answer sends iRacing's search, as the key does today.
+2. **Session starts are recorded the moment a new session is first seen live**, in the car or out of it, into a new `sessions` section. That is normally the tick the translator already detects the change on.
+3. **Incidents are recorded and not yet used.** A new `incidents` section holds each incident at the frame it happened. Next / Previous Incident keeps sending iRacing's search, and a debug line compares where that search lands with what was recorded. Switching the keys over is a later issue, once the comparison has been read (maintainer, 2026-10-12).
+4. **One walk rule for every recorded list.** Markers, lap starts and session starts are all a frame-ordered list stepped from the cursor, so they share the Replay Markers rule instead of each growing its own.
+
+## The sim facts this rests on
+
+Measured on 2026-10-12 over the 92 snapshots in the maintainer's `local/` that carry the replay fields:
+
+- **In the car, `ReplayFrameNumEnd − SessionTime × 60` is constant for a session**, to within one frame: five sessions with two to four snapshots each (SubSessionID 86697546 reads 27994 at 73 s and at 133 s). So a session's start frame can be derived from any in-car tick. A negative result is a session that began before the driver joined, whose start is not on the tape.
+- **Out of the car in a live session, `ReplayFrameNumEnd` counts the frames from the cursor to the end of the tape**, so `ReplayFrameNum + ReplayFrameNumEnd` is the newest frame recorded. Ten snapshots: at the live edge it reads 1 (five snapshots), and scrubbed back it reads the distance to it (1201 at 21 s back, twice; 27630, 34780 and 40182 further back). In each, `(SessionTime − ReplaySessionTime) × 60 − ReplayFrameNumEnd` is between 57 and 60. This settles the reading `replay-laps.ts` calls unconfirmed, and its comment is updated.
+- **`SessionTime` stays live while an in-session replay is scrubbed back**; `ReplaySessionTime` follows the cursor (the same ten snapshots: 1704 s live against 1123 s on screen). Whether `SessionNum` stays live too is not measured, since every one of them is a single-session event. The design does not depend on it (see _Recording session starts_).
+- **A frame recorded live sits about 59 frames before the same moment in replay numbering**: the figure above, and 59 exactly in the one session measured both in the car and across its saved file. This is #1162's `REPLAY_FILE_FRAME_LAG`, recorded and not applied.
+- **Other cars' incident counts are hidden while an official session runs** (survey of 2026-09-21): `CurDriverIncidentCount` reads −1 for every opponent until the race is over. They were visible in the one hosted capture and are always visible with AI.
+
+## Stepping through a recorded list
+
+A list is frame-ordered **landing frames**: the frame a jump to that entry sends. The walk is Replay Markers' (`replay-markers-ops.ts`), moved to `iracing-actions/src/shared/` so Replay Markers and Replay Control call the same functions:
+
+- **The anchor** is the pending landing while it stands, otherwise the cursor (`resolveAnchorFrame`). A second press during a jump therefore steps from where the first is going.
+- **Next** is the first landing more than 60 frames past the anchor. **Previous** goes back to the entry the anchor is in when the anchor is more than 120 frames past it, and to the one before otherwise. These are the marker windows, unchanged.
+- **`steps`** is how many entries to move, at least 1. The keys pass 1; #801's dial passes the detents of a turn. The walk stops at the end of the list and reports how many steps it took. Zero steps is a miss.
+
+**Lap.** The list is every recorded lap start of the car the camera is on (`CamCarIdx`, verified by `carNumberRaw` like every lap lookup), across all sessions of the file. Sessions follow each other in frames, so stepping past a session's last lap reaches the next session's first without a rule for it. A landing is the lap start minus `LAP_START_APPROACH_FRAMES` (60), the lead-in Jump to Fastest Lap already uses. The store gains one reader, `laps.listLapStarts({ carIdx, carNumberRaw })`, and no format change; starts within 60 frames of each other are one entry, so a lap that two recorded sessions both hold is one step.
+
+**Session.** The list is the `sessions` section. A landing is the recorded start plus `SESSION_START_LANDING_FRAMES` (120): with the 59-frame lag, the raw frame lands in the last second of the session before, where the cursor would still read the old session and a second press would find the same start again.
+
+**A miss sends iRacing's search**, the call the key makes today, and logs `record MISS (<reason>)` at debug. The reasons are the store's (`no file`, `no car`, `car mismatch`, `newer format`) plus `nothing that way`. The last one matters: the record ends where the driver left the car, and a step beyond it must still move the replay.
+
+## The jump
+
+`beginReplayJump("replay-control-<mode>", telemetry)` at the press, `recordReplayLanding(frame, now)` as the seek goes out, `runReplayJump`, and `jump.end()` in a `finally`. That gives the press everything #1276 decided: the replay is paused for the seek, nothing follows it until `ReplayFrameNum` reads the frame, and playback afterwards follows the **Replay jump playback** setting. Claiming the cursor cancels a Jump to Fastest Lap walk in flight, which is what these modes do today through `cancelFastestLapWalk`. The outcome updates the action's local speed, so the Play / Pause icons follow.
+
+No camera switch: the lap list is the viewed car's, and a session belongs to everyone. Outside a replay nothing is sent, as now. The four modes stay `api` in the comms catalog.
+
+## Recording session starts
+
+The translator already detects a session change on the tick it happens, and the Race Engineer's brief hangs on that. The record is written at the same moment, by a rule that does not need the edge:
+
+**A session's start is `live frame − round(SessionTime × 60)`, clamped at 0, on the first tick a new `(sessionNum, sessionUniqueId)` is seen live.** On the change tick `SessionTime` is near zero and the start is the live frame. Seen later (the plugin started mid-session, the driver was scrubbed back in a replay when the session rolled over), the same sum gives the same frame, which is what the in-car measurement above shows. So there is one rule and one kind of entry, and no separate path for a change that was missed. A start that would be negative is a session that began before the tape did, and is the tape's start.
+
+**Which ticks are live.** `replay-record-gate.ts` gains a second resolver beside `resolveReplayRecordTick`, which is left exactly as #1354 wrote it and is still the only gate the lap and green recorders use. The new one returns the same shape for two cases:
+
+- **In the car:** `resolveReplayRecordTick`'s own answer, with the frame `ReplayFrameNumEnd`.
+- **Out of the car at the live edge of a live session:** the controller's debounced replay state says a replay, the session is not replay-only (#604's `SimMode`), and `ReplayFrameNumEnd` is at most `LIVE_EDGE_MAX_FRAMES` (120). The frame is `ReplayFrameNum + ReplayFrameNumEnd`.
+
+The live-edge condition is what makes a scrub harmless. If `SessionNum` turns out to follow the cursor in an in-session replay, scrubbing back across a session boundary would otherwise look like a new session seen from the garage. Scrubbed back, the cursor is not at the edge and the tick is not live, so nothing is read from it; the session is recorded on the first tick the driver is back at the edge or in the car, at the same frame. The module comment says there are two classes of tick and which recorder uses which: this one needs only the session's identity, its clock and a frame, and no per-car array.
+
+**Two ticks must agree.** The recorder, `diff/replay-sessions.ts`, runs before the replay guard beside the others. It publishes a session's start once two consecutive live ticks give the same frame to within two frames, so a tick on which the session number has moved and the clock has not cannot put a wrong start in the file. It logs the tick's frame and `SessionTime` at debug when it publishes.
+
+```typescript
+"replay.sessionStarted": SimEvent<
+  "replay.sessionStarted",
+  {
+    /** `WeekendInfo.SubSessionID`; 0 for an offline session. */
+    subSessionId: number;
+    sessionNum: number;
+    sessionUniqueId: number;
+    /** The live replay frame the session began at; 0 when it began before the recording. */
+    frame: number;
+  }
+>;
+```
+
+The `sessions` section holds one entry per pair, in frame order, and the first one recorded stays. A restarted offline event puts the same `sessionNum` on the tape again under a new unique id (maintainer, 2026-10-12): that is a new entry further along the tape, and since every step is by frame, nothing here looks a session up by its number.
+
+## Recording incidents
+
+Both sources sit in one recorder, `diff/replay-incidents.ts`, before the replay guard on #1354's in-car gate, unchanged.
+
+- **The driver's own car** from `PlayerCarMyIncidentCount`: a rise over the previous eligible tick publishes `replay.incident` with that tick's frame. No burst logic is copied from the Race Engineer's incident diff. The store folds a rise within 600 frames of the same car's last entry into that entry (ten seconds, #1122's sequence gap), so one crash is one entry at its first frame.
+- **Other cars** from the session YAML's `DriverInfo.Drivers[].CurDriverIncidentCount`, where the sim shows it: a rise from a non-negative baseline. A −1 is no baseline, and a step from −1 to a number (the reveal after an official race) re-seeds silently, because the frame it belongs to is long past. A decrease re-seeds too (a driver swap). The YAML lags the incident by an unmeasured amount; the comparison below is what measures it.
+
+```typescript
+"replay.incident": SimEvent<
+  "replay.incident",
+  {
+    subSessionId: number;
+    sessionNum: number;
+    sessionUniqueId: number;
+    carIdx: number;
+    carNumberRaw: number;
+    /** The live replay frame on the tick the count rose, recorded raw. */
+    frame: number;
+    sessionTimeMs: number;
+    /** How far the count rose on that tick. */
+    delta: number;
+    /** The driver's own counter, or another car's count in the session YAML. */
+    source: "telemetry" | "sessionInfo";
+  }
+>;
+```
+
+**Stored at the moment, offset at the jump** (maintainer, 2026-10-12): the entry keeps the incident's own frame, and the later consumer subtracts five seconds (300 frames) as a constant that can change without touching a file. No setting.
+
+**The comparison.** After a Next / Previous Incident press, an observer claims the replay cursor, waits for the search to land, and logs at debug the frame it landed on, the camera car, the nearest recorded incident and the difference in frames, or that none is recorded. It sends nothing, and any other replay command cancels it. Landed means two reads 50 ms apart whose frames differ by no more than playback explains, which is the fastest-lap walk's `search` rule widened from a paused replay to a playing one; the wait moves to `shared/replay-seek.ts`, where #801's paced fallback will use it too.
+
+## The store
+
+Two more sections, `sessions` and `incidents`, each with its own module of pure logic and its own `version: 1`, added to `replay-session-store.ts` the way #1354 added `greens`: parallel to the others, changing none of them. Both follow the same compatibility rules: the envelope version does not move, an older build carries the sections through untouched, a section with a higher version is carried through and neither read nor written, and unknown fields survive a write. The unreadable-file merge keeps the file's entry where both have one.
+
+**`no file` keeps its meaning.** `findLapStart` and `findGreen` answer `no file` for a record that was not loaded and holds neither laps nor greens. A record holding only a session start still answers that to them: nothing of theirs was recorded.
+
+Four sections each carrying a parallel set of fields and branches is where a shared shape starts to pay. It is not done here, because it would rewrite two shipped sections inside a feature change; it is a hygiene issue to file once this has merged.
+
+## Out of scope
+
+- **The dial** (#801): the stepping modes, the multi-detent turn and the paced search behind a miss. This issue only makes `steps` a parameter.
+- **Jumping to a recorded incident**, and anything that reads the `incidents` section.
+- **Other cars' incidents in official sessions.** The sim does not show them while the frame is known.
+- **Recording laps or greens from outside the car.** The live-edge frame would allow it, and a spectator's lap record is empty without it, but those recorders read per-car arrays and flags whose behaviour out of the car is its own question (`replay-laps.ts`). A later issue.
+- **A Next / Previous Green pair** (#1354's designed extension).
+- **A setting** for any lead-in or landing offset.
+- **The legacy Replay Navigation action** (#1334). It gains nothing.
+- **Generalising the store's per-section code** (see _The store_).
+
+## Testing
+
+**Unit**, in the package that owns each piece:
+
+- **The shared walk:** next and previous under the marker windows, `steps` above 1, stopping at either end with the count taken, zero steps as a miss, and the anchor taken from a pending landing. Replay Markers' existing walk tests pass unchanged against the moved functions.
+- **Replay Control** (deck-core mock, mocked store): each of the four modes on a hit sends one waited jump to the landing frame and no camera switch; the lap landing is the start minus 60 and the session landing the start plus 120; a second press during a jump steps from the pending landing; every miss reason sends the sim's search once and nothing else; outside a replay nothing is sent; the playback step follows each value of the setting.
+- **`replay-record-gate.ts`:** the new resolver in the car, out of the car at the live edge, out of the car scrubbed back (not live), in a replay-only session and during a seek's blip; `resolveReplayRecordTick` is untouched and its tests pass unchanged.
+- **Session starts:** a session first seen on its change tick, in the car and out of it, publishes one event at the live frame; first seen ten minutes in, it publishes the same frame; a start before the tape publishes 0; a single tick whose clock disagrees with the next publishes nothing until two agree; a scrubbed-back replay across a session boundary publishes nothing, and the session is published once the cursor is back at the edge; a replay-only session publishes nothing; a pair already published is not published again; a restarted event's second instance of a session number publishes a second start, later on the tape. The recorder's position in `handleTick` is pinned as pre-guard. A fixture is cut from the 2026-09-28 and 2026-09-29 snapshots for the out-of-car frame.
+- **Incidents:** the first tick seeds; a rise publishes with that tick's frame; an ineligible window re-seeds; for other cars, −1 is no baseline, −1 to a number is silent, a decrease re-seeds, and the player's car is not published twice.
+- **The store:** record and list for both sections; a session's first start staying when a second arrives; the 600-frame fold; a newer version carried through; unknown fields kept; every other section surviving a write; the unreadable-file merge; the offline record never reaching disk; `findLapStart` and `findGreen` still answering `no file` for a record with only a session start.
+- **Catalog and harness:** both events compile in `event-names.ts`, and the settings-phase test holds each to its section.
+
+**Manual, in the sim**, with the log at debug:
+
+1. **Lap keys, record path.** After a race driven in the car, in the in-session replay: Next Lap and Previous Lap land a second before the viewed car's line, from near and from more than 20000 frames away, once paused and once playing. Two quick presses land two laps on.
+2. **Session keys, and the capture for `SessionNum`.** An event with practice, qualifying and a race, out of the car as each session ends. The file must hold one start per session, and Next / Previous Session must land just inside each. Then, during the race session and out of the car, scrub back into qualifying with a Telemetry Display key showing `{{telemetry.SessionNum}}` beside `{{telemetry.ReplaySessionNum}}`: record in this spec whether `SessionNum` followed the cursor. Either way, no new entry may appear in the file.
+3. **Fallback.** A replay recorded without the plugin: all four keys behave as they do today, with `record MISS (no file)` in the log. In a recorded session, Next Lap past the last recorded lap logs `nothing that way` and still moves.
+4. **Replay jump playback.** Each of the three values, with a lap step and a session step.
+5. **Incidents.** An AI race with at least one incident of the driver's own and one of another car: the session file holds both, the driver's at the frame the count rose. Step through them with Next Incident and read the comparison lines. **These are the capture for the YAML lag and for the later decision.**
+6. **Official session.** After an official race, the file holds the driver's own incidents and no other car's.
+7. **Saved file.** Reopen a saved replay of a recorded session: the lap and session keys land where they did in the session, about a second earlier.
