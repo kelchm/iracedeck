@@ -11,8 +11,8 @@ A replay key that starts a search or a long jump looks the same while the replay
 1. **Only the pressed key shows it.** Not the other replay keys on the page. A press that came from a dial shows on that dial's own box (proposed; maintainer's leaning, 2026-10-13: "Maybe it would look neater if only the pressed key has the spinner").
 2. **Three looks.** **Working**: a spinner, stepped, while the key's own jump or search is under way. **Waiting**: a still mark while the key's press is held behind something else. **Not done**: a sign for one second when the plugin gave up or ignored the press.
 3. **The gate is the only source.** The looks are drawn from the per-key view that #1430's gate hands out. The indicator decides nothing about the replay and sends nothing.
-4. **The spinner is redrawn images** through the image path every key already uses, four a second, eight frames to a turn (maintainer, 2026-10-13: "we can just redraw the images. We don't need that many per second to make it good-enough"). No GIF, no new member on any adapter.
-5. **Nothing shows for 0.75 s after the press**, so a jump that lands at once never flickers. The look ends on what the gate reports, never on a clock.
+4. **The spinner is redrawn images** through the image path every key already uses, eight a second, eight frames to a turn (maintainer, 2026-10-13: "we can just redraw the images. We don't need that many per second to make it good-enough", and, having seen the rates side by side, "frame rate of 8"). No GIF, no new member on any adapter.
+5. **Nothing shows for a short delay after the press**, so a jump that lands at once never flickers. The delay is 0.5 s as this stands (maintainer, 2026-10-13: "Start delay should be just like .5 seconds") and is open again: the same day he asked "why not show the spinner immediately?" (_When it starts and when it ends_). The look ends on what the gate reports, never on a clock.
 6. **One timer for the plugin**, alive only while a key on screen is showing the spinner. With nothing under way nothing is redrawn and no timer exists.
 
 ## What this rests on
@@ -48,7 +48,7 @@ The keys had the default border and no glow. #642 measured 2.86 ms at 144 px for
 
 - **An origin token on every send.** The Stream Deck context id of the key or dial that was pressed, passed by the surface and never read by the gate. Whatever the gate sends on a press's behalf keeps that press's token: a held search once it goes out, a takeover's jump, a sequence's playback step. `beginReplayJump` takes the token and its `end` takes a result, so the fastest-lap and green-flag searches, a record jump and a marker jump report through the same seam.
 - **A view per token**, with two facts that can both hold: **under way** (this token's position jump has a target standing, its search has not landed, or its replay jump holds the cursor) and **waiting** (this token's command is in the gate's waiting slot). Each carries `since`: the time of the press, kept across a hand-over from waiting to under way.
-- **A fact is dated from the first command of its token's unbroken run.** A token that keeps sending while its fact stands (a spin of marker detents, #801's turns that keep retargeting, a held search that goes out) stays in one run, and `since` is that run's first command. The 0.75 s delay depends on this rule: without it a spin would restart the delay at every detent and never show anything, and a spinner already showing would blink off at a hand-over. The rule is #1430's to state, and #801's spec leans on it too.
+- **A fact is dated from the first command of its token's unbroken run.** A token that keeps sending while its fact stands (a spin of marker detents, #801's turns that keep retargeting, a held search that goes out) stays in one run, and `since` is that run's first command. The start delay depends on this rule: without it a spin would restart the delay at every detent and never show anything, and a spinner already showing would blink off at a hand-over. The rule is #1430's to state, and #801's spec leans on it too.
 - **How a fact ends**, in three classes with the reason underneath: **completed**, **superseded** (the user's own newer replay command ended it) and **gave up** (off target, the wait ran out, nothing moved, the search gave up, the command was refused).
 - **One notice per change** through the gate's `subscribe`, and a getter for the same view.
 
@@ -60,8 +60,8 @@ One thing never reaches the gate: a press the action ignores itself because a fa
 
 | The gate says, for this key's token | The key shows |
 | --- | --- |
-| Under way, and the key's mode is a jump or a search | Working, from 0.75 s after `since` |
-| Waiting | Waiting, from 0.75 s after `since` |
+| Under way, and the key's mode is a jump or a search | Working, from 0.5 s after `since` |
+| Waiting | Waiting, from 0.5 s after `since` |
 | Both | Waiting |
 | A fact ended as completed or superseded | Its ordinary icon, at once |
 | A fact ended as gave up, for any reason | Not done for one second, at once and whatever the delay, then its ordinary icon |
@@ -87,34 +87,46 @@ One thing never reaches the gate: a press the action ignores itself because a fa
 
 ## The looks
 
-Three families were drawn through the real pipeline and are with the maintainer as a browser page:
+Three families were drawn through the real pipeline and shown to the maintainer as a browser page with the frame rates side by side. **A is chosen** (maintainer, 2026-10-13: "I like the look of A").
 
-- **A, in place of the artwork (recommended).** The artwork gives way to the mark and the title and border stay, so the key still says what it is. Working is eight dots in a ring with one bright dot and a fading tail; waiting is three dots in a row; not done is a red cross. It is the largest of the three, and a ring of dots reads as stepping on purpose at four frames a second, where a smooth arc looks like it stutters.
-- **B, a corner badge.** The key stays as it is and a round badge in the top right corner carries a small arc, three dots or a red cross. Small on a 72-pixel key.
-- **C, on the border.** The key stays as it is and a bright stretch runs round its edge; waiting is a dashed edge, not done a red one. It competes with the user's own border colour and glow.
+- **A, in place of the artwork.** The artwork gives way to the mark and the title and border stay, so the key still says what it is. Working is eight dots in a ring with one bright dot and a fading tail; waiting is three dots in a row; not done is a red cross. It is the largest of the three, and a ring of dots reads as stepping on purpose at a low frame rate, where a smooth arc looks like it stutters.
+- **B, a corner badge**, not chosen. The key stays as it is and a round badge in the top right corner carries a small arc, three dots or a red cross. Small on a 72-pixel key.
+- **C, on the border**, not chosen. The key stays as it is and a bright stretch runs round its edge; waiting is a dashed edge, not done a red one. It competes with the user's own border colour and glow.
 
-Whichever is chosen:
+How A is built:
 
 - **The marks are drawn in code**, in `@iracedeck/icon-composer` beside the binding-missing glyph, from circles, lines and opacity only. They need no filter, so they survive the `pngRasterization` kill-switch, and they add no icon file, preview or `icon-defaults.json` entry.
 - **They take the key's own colours**: the mark in `graphic1Color`, falling back to `textColor`, on the user's background. The red of not done is the fixed semantic red (`#e74c3c`), as on every other key.
-- **A key with its title hidden** shows the mark alone under A. It is the key that was just pressed, for a few seconds.
+- **A key with its title hidden** shows the mark alone. It is the key that was just pressed, for a few seconds.
 - **`assembleIcon` takes the mark as an option**, as it takes `bindingMissing` and `dimmed`. Replay Control's two hand-assembled icons (Speed Display, Set Speed) call the same mark function.
 
 ## Frame rate and cost
 
-**Four frames a second** (`REPLAY_BUSY_FRAME_MS`, 250), eight frames to a turn, so one turn takes two seconds. It is the cadence Session Info's flash already runs at, and under half the repo's ceiling for one key.
+**Eight frames a second** (`REPLAY_BUSY_FRAME_MS`, 125), eight frames to a turn, so the bright dot goes round once a second, as on the page the maintainer chose it from. Four a second was proposed and he preferred eight. It is twice the rate of anything that redraws a key on a timer today (Session Info's flash, four a second for three seconds) and eight tenths of the repo's own ceiling of ten a second for one key, so it leaves little room: nothing else may redraw a spinning key on its own clock. How eight a second reads on a Stream Deck and on the Mirabox is the first thing the hands-on round answers, and the rate is one constant if a host does not keep up.
 
-- **Frames are drawn when shown, and the rasterizer's cache is the frame cache.** A frame is the key's own SVG with the mark at step _n_, so the same key at the same step is the same text and a cache hit. The first turn costs eight renders, 10 to 25 ms in all by size and glow, off the main thread. Every turn after that costs none. No frame set is precomputed and no second cache is built, so a colour or title change needs no invalidation: it is simply different text.
-- **Host messages**: four image sets a second for a key that is spinning, each a PNG of 4 to 7 KB at 144 px, so 20 to 40 KB a second as base64 over the local socket. Waiting and not done cost one image set each.
-- **Several keys at once** is two or three by construction. The gate has one waiting slot (one still key), and one jump or search under way with at most a hand-over beside it. Three keys spinning would be twelve image sets a second for the whole plugin. For scale, the flags overlay redraws every opted-in key on every page twice a second for as long as a flag flies, and #642 budgeted 32 keys each changing ten times a second as about one core.
+- **Frames are drawn when shown, and the rasterizer's cache is the frame cache.** A frame is the key's own SVG with the mark at step _n_, so the same key at the same step is the same text and a cache hit. The first turn costs eight renders, 10 to 25 ms in all by size and glow, off the main thread and spread over its one second. Every turn after that costs none. The frame rate changes neither number: there are eight frames to a turn at any rate. No frame set is precomputed and no second cache is built, so a colour or title change needs no invalidation: it is simply different text.
+- **Host messages**: eight image sets a second for a key that is spinning, each a PNG of 4 to 7 KB at 144 px, so 45 to 75 KB a second as base64 over the local socket. Waiting and not done cost one image set each.
+- **Several surfaces at once** is two or three by construction. The gate has one waiting slot (one still key), and one jump or search under way with at most a hand-over beside it. Two keys spinning are sixteen image sets a second for the whole plugin and three are twenty-four; a key and a dial box together are twelve, since the box's mark steps on every second tick (_Dials_). For scale, the flags overlay redraws every opted-in key on every page twice a second for as long as a flag flies, and #642 budgeted 32 keys each changing ten times a second as about one core.
 - **The 512-entry cache** takes eight entries for a spinning key's look. They are the newest entries while it spins and age out like any other.
-- **Per host.** Stream Deck: `setImage` with a PNG at 144 to 240 px by device. Mirabox: `setImage` at 144 px. Ulanzi: one `state` frame, type 1, at 144 px. None has a documented rate limit, and four a second on one key is inside what the flags overlay and Session Info already send on all three.
+- **Per host.** Stream Deck: `setImage` with a PNG at 144 to 240 px by device. Mirabox: `setImage` at 144 px. Ulanzi: one `state` frame, type 1, at 144 px. None has a documented rate limit. Eight a second on one key is more than any key is sent today on a timer: the flags overlay sends two a second and Session Info four. The nearest thing that ships is a dial screen at up to ten a second, which on the Mirabox is the same `setImage` call. So the rate is inside the repo's ceiling and untried on a key.
 
 ## When it starts and when it ends
 
-- **`REPLAY_BUSY_SHOW_AFTER_MS` is 750**, counted from the fact's `since`, which is the press. It is a display delay and nothing correct rests on it.
-- **Measured against** the jumps above: on the maintainer's machine nothing shows for a jump shorter than about 100000 frames (some 28 minutes of recording), for a search that finds something within that distance, for a press held behind any of those, or for the 415 ms a jump is carried out late. What shows: the fallback searches from 0.75 s on, a jump across a long recording, a far search, a search with nothing to find on a paused replay, and a press held behind any of these. A slower machine shows it for shorter jumps, which is right: there the wait is real.
-- **A jump that takes between 0.75 s and 1 s shows one frame.** No minimum showing time is added (see _Rejected_).
+- **`REPLAY_BUSY_SHOW_AFTER_MS` is 500**, counted from the fact's `since`, which is the press. It is a display delay and nothing correct rests on it. 750 was proposed; the maintainer set 500.
+- **Measured against** the jumps above: on the maintainer's machine a jump of 60000 frames took 400 ms from near the start of the recording and 490 ms from its middle, and 120000 frames took 896 ms. So the edge is at about 60000 to 70000 frames, some 17 to 20 minutes of recording: a jump shorter than that shows nothing, and so does a search that finds something within that distance or a press held behind either. At 750 the edge was about 100000 frames, so jumps between the two now show the spinner where they would not have.
+- **The 415 ms a jump is carried out late is still under it, by 85 ms and no longer by 335.** The second of two jumps pressed close together lands about 415 ms after the first, plus its own travel. On the maintainer's machine a short one stays under the half second; a longer one, or the same one on a slower machine, shows the dots for a frame or two. That is the cost of the shorter delay, and it is a true drawing: the press did wait that long.
+- **What shows**: the fallback searches from 0.5 s on, a jump of more than about a quarter of an hour of recording, a far search, a search with nothing to find on a paused replay, and a press held behind any of these. A slower machine shows it for shorter jumps, which is right: there the wait is real.
+- **A jump that takes between 0.5 s and 0.625 s shows one frame**, an eighth of a second. No minimum showing time is added (see _Rejected_).
+- **Open: no delay at all.** The maintainer asked for it after setting 0.5 s, and 0, 0.2 and 0.5 s are on the options page against a 70 ms landing, a 450 ms landing and a five-second search. What a delay of 0 changes:
+  - **Every press of a jump or search key shows the mark for as long as the replay takes.** Most land inside one frame: a lap search took 68 ms and go to start 31 to 46 ms, against a frame of 125 ms. So an ordinary press blinks the dots once. Whether that is noise or a welcome sign that the press registered is his call.
+  - **Two more image sets on each such press**, the mark and then the icon again. Five quick presses of Next Lap are ten.
+  - **No rendering cost worth a pre-render.** The first press of a key renders one frame, 1 to 3 ms off the main thread, and the cache holds it for every press after. Nothing needs rendering at startup or when a key appears.
+  - **A held press shows its three dots at once**: a Play pressed during an ordinary jump, for the 0.4 s that jump takes.
+  - **On a dial every marker detent blinks the mark** in the caption. The box's throttle coalesces pushes, so a blink shorter than its 100 ms window may never be drawn.
+  - **Not done is unchanged**; it has no delay either way.
+  - **The dating rule is still needed** for the hand-over from waiting to under way, which must not pass through the ordinary icon. Nothing is left for a spin to restart.
+  - **The per-token delay timer goes**, and the interval is created and cleared on each press.
+  - **What a deck does with a 70 ms image** is not known: this page draws every frame, and a host may show the blink, skip it, or show it late.
 - **It ends on the gate's notice**, and at the latest one frame after the gate's view stops listing the fact (below).
 
 ## The timer, and why it stops
@@ -123,7 +135,7 @@ A new module, `shared/replay-busy-indicator.ts`, owns everything timed:
 
 - **Surfaces register a token with a redraw callback** when the key appears and remove it when it disappears. The indicator answers one pure question, "what does this token show now" (rest, working at step _n_, waiting, not done), and calls the redraw when the answer changes. The action's own icon function stays the only place a key is drawn; it takes the answer as an input.
 - **One interval for the plugin**, started when the first registered token begins to show working and cleared when none does. One step counter, so keys spinning together are in step.
-- **A one-shot timer per token** for the 0.75 s, and one for the second of not done.
+- **A one-shot timer per token** for the 0.5 s, and one for the second of not done.
 - **Every tick reads the gate's view again** for each spinning token. A token with nothing under way stops there. So a notice that never arrives costs one frame, not a spinner that never ends: the tick is the reader, and a notice only makes it prompt.
 - **Each way it stops:** the fact ends (landed, superseded, gave up); the key disappears; the sim disconnects, which ends every fact at once; the replay is left, which ends a search, a waiting press and a replay jump with no target as soon as the debounced replay state says so; and, as the last line, a spinner that has been showing for five minutes stops with a warning (`REPLAY_BUSY_MAX_SHOW_MS`). That ceiling sends nothing and decides nothing about the replay. Reaching it means the gate reported a fact that never ended, which is a fault to find, or a search on a recording far longer than the six hours this is designed for, where the key goes back to its icon while the search runs on.
 - **A position jump's target outlives the replay being left**, by at most its jump's own wait in the gate: the larger of 3 s and twice the jump's length at 2048 frames a sim update, about 20 s across a six-hour recording (added 2026-10-13, from the gate's owner). A seek and the garage read the same in telemetry, so the gate cannot end it sooner without dropping a press held behind a real ten-second jump. A key whose jump was under way when the user left the replay therefore goes on showing working for up to that long and then shows not done.
@@ -140,7 +152,7 @@ The Replay Control and Replay Markers dial boxes show the same three states, for
 - **The caption's text keeps its place beside the mark** when it is #801's pending count (`+3`, `-2`): the count is progress, which a mark cannot show, so the mark never replaces it (amended 2026-10-13, with #801's spec). The play state, which is all the caption says otherwise, gives way to the mark as it gives way to the count. `DialBoxArgs` gains the mark as an optional argument, drawn by both the strip and the knob renderer; a surface that passes none draws exactly as before.
 - **Two dials on one run** (#801): the run keeps the token of the dial whose turn started it, so that dial shows the mark. A second dial that adds to the same count shows the count and no mark. A turn that replaces the count for another target starts a run with its own token, and the first ends superseded and shows nothing more.
 - **Car mode passes no token and draws nothing**, with the car and camera keys (#1435).
-- **Through the surface's existing render path**: the frame's signature gains the indicator's answer, and its 10-a-second throttle already covers four a second. On a Stream Deck + that is `setFeedback`; on a Mirabox knob the 176 × 112 screen image; Ulanzi dials are not declared.
+- **Through the surface's existing render path**: the frame's signature gains the indicator's answer, and its 10-a-second throttle stays in front of it. The box's mark has three positions, not eight, so it steps on every second tick of the indicator: four pushes a second, each dot lit for a quarter of a second, which leaves the box room under its ceiling for the value changing as well. On a Stream Deck + that is `setFeedback`; on a Mirabox knob the 176 × 112 screen image; Ulanzi dials are not declared.
 - **A Frame Jog or Speed Control turn draws nothing**, as above.
 
 A marker jump from the Replay Markers dial across a long recording takes the same ten seconds as from a key, which is why the dials are in this issue and not a later one.
@@ -184,24 +196,33 @@ Files touched:
 
 ## What the user sees
 
-- Press Jump to Fastest Lap when the plugin has no record of the lap: after three quarters of a second the key's artwork gives way to a ring of stepping dots, until the replay arrives. If the search finds nothing the key shows a red cross for a second.
+- Press Jump to Fastest Lap when the plugin has no record of the lap: after half a second the key's artwork gives way to a ring of dots with one bright dot going round once a second, until the replay arrives. If the search finds nothing the key shows a red cross for a second.
 - Press Next Marker for a marker hours away in a long recording: the same dots until the replay is there.
 - Press Play while a far jump is still on its way: the Play key shows three still dots until the jump lands and the replay plays.
 - Press a second Jump to Fastest Lap key while one is searching: it shows the red cross for a second.
 - Press anything that lands at once: nothing changes on the key.
 
-## Open questions
+## What was asked, and how each stands
 
-For the maintainer; each has a proposal above.
+Eight questions were put to the maintainer on 2026-10-13.
 
-1. **Which look**: A, B or C.
-2. **The frame rate**: four a second, or another of the rates on the page.
-3. **Waiting as a still mark of its own**, or the same spinner as working.
-4. **Not done**: the red cross for a second on every give-up and on an ignored press, or nothing.
-5. **The dials in this issue**, or keys only.
-6. **The delay** of 0.75 s.
-7. **No setting** for any of it, including one to turn it off.
-8. **The website wording**, shown in full when it is written.
+**Decided by his word** ("I like the look of A, and frame rate of 8"):
+
+- **The look**: A.
+- **The frame rate**: eight a second. Four was proposed.
+
+**Standing on the proposal.** These were put to him as standing unless he said otherwise, and he did not take them up. They are defaults, not decisions of his, so an objection later changes a default:
+
+- **Waiting is a still mark of its own**, not the spinner.
+- **Not done is the red cross for one second**, on every give-up and on a press ignored because a search is in flight.
+- **The dial boxes are in this issue.**
+- **There is no setting** for any of it, including one to turn it off.
+- **A search with nothing to find on a paused replay** spins until its distance bound, up to about 20 s deep in a six-hour recording, then shows the cross.
+
+**Still open:**
+
+- **The start delay.** 0.75 s was proposed; he said "Start delay should be just like .5 seconds" and then asked "why not show the spinner immediately?". This spec is written at 0.5 s until he has seen 0, 0.2 and 0.5 s side by side. #801's spec cites the delay, and it keeps the old number until this one is settled.
+- **The website wording**, shown to him in full when it is written.
 
 ## Out of scope
 
@@ -218,29 +239,30 @@ For the maintainer; each has a proposal above.
 
 **Unit:**
 
-- **The mark:** each of the three, for the chosen family, is built from the safe SVG feature set only (a test refuses `filter`, `mask`, `clipPath` and `style`); step _n_ and step _n_ + 8 are the same text; the colours follow the slots; `assembleIcon` with no mark gives byte-identical output to today's.
-- **The indicator, on fake timers and a fake gate:** nothing is drawn and no timer exists while no fact stands; under way for less than 0.75 s draws nothing at all; at 0.75 s it draws working and steps every 250 ms; waiting draws once and no interval is created; both facts draw waiting; completed and superseded return to rest with one redraw; gave up draws not done at once, inside the delay too, and rest one second later; an ignored press draws not done, and nothing on a key already working; a hand-over from waiting to under way does not restart the delay; a key that disappears is not redrawn and the interval ends with the last one; a key that reappears with a fact standing draws at once; a tick that finds the fact gone stops without a notice; the five-minute ceiling stops and warns; a redraw that throws does not stop the others; two keys spinning share one interval and one step.
+- **The mark:** each of the three is built from the safe SVG feature set only (a test refuses `filter`, `mask`, `clipPath` and `style`); step _n_ and step _n_ + 8 are the same text; the colours follow the slots; `assembleIcon` with no mark gives byte-identical output to today's.
+- **The indicator, on fake timers and a fake gate:** nothing is drawn and no timer exists while no fact stands; under way for less than 0.5 s draws nothing at all; at 0.5 s it draws working and steps every 125 ms; waiting draws once and no interval is created; both facts draw waiting; completed and superseded return to rest with one redraw; gave up draws not done at once, inside the delay too, and rest one second later; an ignored press draws not done, and nothing on a key already working; a hand-over from waiting to under way does not restart the delay; a key that disappears is not redrawn and the interval ends with the last one; a key that reappears with a fact standing draws at once; a tick that finds the fact gone stops without a notice; the five-minute ceiling stops and warns; a redraw that throws does not stop the others; two keys spinning share one interval and one step.
 - **The per-mode rule:** a Frame Forward key with a long run of its own jumps never draws working and does draw waiting and not done.
 - **The actions:** Replay Control and Replay Markers pass the answer to their icon functions, register on appear and unregister on disappear, and Replay Markers' busy look wins over "nothing to jump to".
-- **The dial surfaces:** the signature changes with the answer, a turn with no token draws nothing, and pushes stay under the throttle; with a pending count the caption draws the mark and the count together, on the strip and on the knob; a box with no mark is byte-identical to today's.
+- **The dial surfaces:** the signature changes with the answer, a turn with no token draws nothing, the mark steps on every second tick, and pushes stay under the throttle; with a pending count the caption draws the mark and the count together, on the strip and on the knob; a box with no mark is byte-identical to today's.
 - **Cost:** a test renders eight frames twice through the rasterizer service and holds that the second turn renders nothing.
 
 **The real code against the sim** (the harness used for #1317 and #1430), with image sets recorded in place of a deck:
 
-1. A jump of 30000 frames: no image set beyond the key's ordinary ones.
-2. A jump across the recording: the first working frame between 0.75 and 1 s after the press, four a second after it, and the ordinary icon within one frame of the landing reading back.
+1. A jump of 30000 frames: no image set beyond the key's ordinary ones. A jump of 60000 frames from near the start of the recording and from its middle, ten times each: how often a frame shows, which is the edge of the delay on this machine.
+2. A jump across the recording: the first working frame between 0.5 and 0.625 s after the press, eight a second after it, and the ordinary icon within one frame of the landing reading back.
 3. Jump to Fastest Lap with no record, for a car that is found and for one that is not: working throughout, then rest or not done.
 4. A Play held behind that long jump: waiting on the Play's token, then rest.
 5. Next Incident with nothing ahead on a paused and on a playing replay: not done after the search's bound, and after about 0.4 s.
 
-**Manual, in an iRacing replay**, on a Stream Deck + and on the Mirabox, since how a key looks while it is redrawn four times a second is a property of the host and the hardware:
+**Manual, in an iRacing replay**, on a Stream Deck + and on the Mirabox, since how a key looks while it is redrawn eight times a second is a property of the host and the hardware:
 
 1. Each of the five cases under _What the user sees_.
-2. A search of ten seconds or more: the spinner steps evenly, the key does not flicker between frames, and the other keys on the page stay responsive.
-3. Turn the page while a key spins and turn back: it is spinning; turn back after the landing: it is at rest.
-4. Leave the replay for the car while a search key spins: it returns to its icon. Leave it during a long position jump: the key goes on spinning for up to the jump's wait, then shows not done.
-5. A detent of the Replay Markers dial to a marker far away: the box shows the dots. A Frame Jog spin of several seconds: it does not.
-6. With the user's own colours, a hidden title and a border with glow on the key: the mark still reads.
-7. With a flag flying and the flags overlay on: the flag flashes, and the key is right when it clears.
+2. A search of ten seconds or more: the bright dot goes round once a second without stalling or skipping, the key does not flicker between frames, and the other keys on the page stay responsive. If a host cannot keep up at eight a second, that is the finding, and the rate is the constant to lower.
+3. Two marker keys pressed close together, and a Play pressed during an ordinary jump: whether the dots flash, and whether that reads as a fault.
+4. Turn the page while a key spins and turn back: it is spinning; turn back after the landing: it is at rest.
+5. Leave the replay for the car while a search key spins: it returns to its icon. Leave it during a long position jump: the key goes on spinning for up to the jump's wait, then shows not done.
+6. A detent of the Replay Markers dial to a marker far away: the box shows the dots. A Frame Jog spin of several seconds: it does not.
+7. With the user's own colours, a hidden title and a border with glow on the key: the mark still reads.
+8. With a flag flying and the flags overlay on: the flag flashes, and the key is right when it clears.
 
-The Ulanzi host cannot be tested by the maintainer (no hardware). What is unknown there, and on any host, is only how four image sets a second look on the device, and the flags overlay already sends two a second to every opted-in key on all three.
+The Ulanzi host cannot be tested by the maintainer (no hardware). What is unknown there, and on any host until the round above, is how eight image sets a second look on a key: the most a key is sent on a timer today is four.
