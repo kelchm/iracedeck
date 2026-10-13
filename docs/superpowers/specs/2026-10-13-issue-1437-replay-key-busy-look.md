@@ -48,6 +48,7 @@ The keys had the default border and no glow. #642 measured 2.86 ms at 144 px for
 
 - **An origin token on every send.** The Stream Deck context id of the key or dial that was pressed, passed by the surface and never read by the gate. Whatever the gate sends on a press's behalf keeps that press's token: a held search once it goes out, a takeover's jump, a sequence's playback step. `beginReplayJump` takes the token and its `end` takes a result, so the fastest-lap and green-flag searches, a record jump and a marker jump report through the same seam.
 - **A view per token**, with two facts that can both hold: **under way** (this token's position jump has a target standing, its search has not landed, or its replay jump holds the cursor) and **waiting** (this token's command is in the gate's waiting slot). Each carries `since`: the time of the press, kept across a hand-over from waiting to under way.
+- **A fact is dated from the first command of its token's unbroken run.** A token that keeps sending while its fact stands (a spin of marker detents, #801's turns that keep retargeting, a held search that goes out) stays in one run, and `since` is that run's first command. The 0.75 s delay depends on this rule: without it a spin would restart the delay at every detent and never show anything, and a spinner already showing would blink off at a hand-over. The rule is #1430's to state, and #801's spec leans on it too.
 - **How a fact ends**, in three classes with the reason underneath: **completed**, **superseded** (the user's own newer replay command ended it) and **gave up** (off target, the wait ran out, nothing moved, the search gave up, the command was refused).
 - **One notice per change** through the gate's `subscribe`, and a getter for the same view.
 
@@ -135,7 +136,10 @@ A new module, `shared/replay-busy-indicator.ts`, owns everything timed:
 
 The Replay Control and Replay Markers dial boxes show the same three states, for a push, a gesture, a marker detent and #801's runner:
 
-- **In the box's caption line**, drawn by the surface's own renderer: the stepping dots for working, three still dots for waiting, a red cross for not done. The value stays where it is.
+- **At the left end of the box's caption line**, at the caption's own height: three dots with the bright one stepping across for working, three even still dots for waiting, a small red cross for not done. The label and the value stay where they are. This is the box's own mark and is the same whichever of the key looks is chosen; a ring of dots does not fit a caption line.
+- **The caption's text keeps its place beside the mark** when it is #801's pending count (`+3`, `-2`): the count is progress, which a mark cannot show, so the mark never replaces it (amended 2026-10-13, with #801's spec). The play state, which is all the caption says otherwise, gives way to the mark as it gives way to the count. `DialBoxArgs` gains the mark as an optional argument, drawn by both the strip and the knob renderer; a surface that passes none draws exactly as before.
+- **Two dials on one run** (#801): the run keeps the token of the dial whose turn started it, so that dial shows the mark. A second dial that adds to the same count shows the count and no mark. A turn that replaces the count for another target starts a run with its own token, and the first ends superseded and shows nothing more.
+- **Car mode passes no token and draws nothing**, with the car and camera keys (#1435).
 - **Through the surface's existing render path**: the frame's signature gains the indicator's answer, and its 10-a-second throttle already covers four a second. On a Stream Deck + that is `setFeedback`; on a Mirabox knob the 176 × 112 screen image; Ulanzi dials are not declared.
 - **A Frame Jog or Speed Control turn draws nothing**, as above.
 
@@ -175,7 +179,7 @@ Files touched:
 - **`icon-composer`:** `assembleIcon` gains the mark option; the package's `CLAUDE.md`.
 - **`replay-control.ts`:** the icon function takes the indicator's answer; keys register and unregister; the ignored press is reported; the redraw de-duplication key gains the answer.
 - **`replay-markers.ts`:** the same for Next and Previous. The busy look wins over the greyed "nothing to jump to" look, and `needsRedraw` learns of it.
-- **The two dial surfaces:** the caption line and the signature.
+- **The two dial surfaces:** the caption line and the signature. **`shared/dial-box.ts`** and its strip and knob renderers: the optional caption mark.
 - **Docs:** the Replay Control and Replay Markers website pages (a short section on the three looks, and "press again to act now" if #1430 lands that rule), `.claude/rules/key-icon-types.md` beside the binding-missing glyph, `.claude/rules/encoders-and-touchscreen.md` for the dial boxes, `packages/iracing-actions/CLAUDE.md`. The `iracedeck-actions` skill lists modes and settings, none of which change. There is no manifest or Property Inspector change, so the three plugins need nothing but the build.
 
 ## What the user sees
@@ -218,7 +222,7 @@ For the maintainer; each has a proposal above.
 - **The indicator, on fake timers and a fake gate:** nothing is drawn and no timer exists while no fact stands; under way for less than 0.75 s draws nothing at all; at 0.75 s it draws working and steps every 250 ms; waiting draws once and no interval is created; both facts draw waiting; completed and superseded return to rest with one redraw; gave up draws not done at once, inside the delay too, and rest one second later; an ignored press draws not done, and nothing on a key already working; a hand-over from waiting to under way does not restart the delay; a key that disappears is not redrawn and the interval ends with the last one; a key that reappears with a fact standing draws at once; a tick that finds the fact gone stops without a notice; the five-minute ceiling stops and warns; a redraw that throws does not stop the others; two keys spinning share one interval and one step.
 - **The per-mode rule:** a Frame Forward key with a long run of its own jumps never draws working and does draw waiting and not done.
 - **The actions:** Replay Control and Replay Markers pass the answer to their icon functions, register on appear and unregister on disappear, and Replay Markers' busy look wins over "nothing to jump to".
-- **The dial surfaces:** the signature changes with the answer, a turn with no token draws nothing, and pushes stay under the throttle.
+- **The dial surfaces:** the signature changes with the answer, a turn with no token draws nothing, and pushes stay under the throttle; with a pending count the caption draws the mark and the count together, on the strip and on the knob; a box with no mark is byte-identical to today's.
 - **Cost:** a test renders eight frames twice through the rasterizer service and holds that the second turn renders nothing.
 
 **The real code against the sim** (the harness used for #1317 and #1430), with image sets recorded in place of a deck:
