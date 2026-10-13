@@ -71,7 +71,7 @@ One thing never reaches the gate: a press the action ignores itself because a fa
 - **Waiting wins over working** because it is the one that tells the user something to do. Under the rule #1430 is settling (a press behind a search waits for its landing, and pressing again acts at once), a second press is the way out of a long wait, and the still mark is what says a press is waiting.
 - **Stillness and motion mean different things.** Motion: the plugin is moving the replay for this key. A still mark: this press is queued behind something else.
 - **One drawing whether or not telemetry shows the search.** The gate's view says whether a search is seen or only possible. The key does not claim to know more than the gate, and the two differ only in when they end.
-- **A search with nothing to find on a paused replay** shows working until the time its distance could take has passed, then not done. Deep in a six-hour recording that is up to about 20 s of spinner on, say, Next Incident with no incident ahead. It is the honest drawing of what the gate believes, and the gate holds other presses for the same time.
+- **A search with nothing to find on a paused replay** shows working until the time its distance could take has passed, then not done. Deep in a six-hour recording that is up to about 20 s of spinner on, say, Next Incident with no incident ahead. It is the honest drawing of what the gate believes, and a press made meanwhile is held for the same time unless it is pressed again.
 - **Superseded shows nothing.** The user's own newer press is the reason, and that key now carries the look.
 - **Not done is not delayed.** It is the answer to the press: no next incident, the search found no lap, the jump ended somewhere else.
 
@@ -124,7 +124,8 @@ A new module, `shared/replay-busy-indicator.ts`, owns everything timed:
 - **One interval for the plugin**, started when the first registered token begins to show working and cleared when none does. One step counter, so keys spinning together are in step.
 - **A one-shot timer per token** for the 0.75 s, and one for the second of not done.
 - **Every tick reads the gate's view again** for each spinning token. A token with nothing under way stops there. So a notice that never arrives costs one frame, not a spinner that never ends: the tick is the reader, and a notice only makes it prompt.
-- **Each way it stops:** the fact ends (landed, superseded, gave up); the key disappears; the sim disconnects or the replay is left, which the gate ends by its own rules; and, as the last line, a spinner that has been showing for five minutes stops with a warning (`REPLAY_BUSY_MAX_SHOW_MS`). That ceiling sends nothing and decides nothing about the replay. Reaching it means the gate reported a fact that never ended, which is a fault to find, or a search on a recording far longer than the six hours this is designed for, where the key goes back to its icon while the search runs on.
+- **Each way it stops:** the fact ends (landed, superseded, gave up); the key disappears; the sim disconnects, which ends every fact at once; the replay is left, which ends a search, a waiting press and a replay jump with no target as soon as the debounced replay state says so; and, as the last line, a spinner that has been showing for five minutes stops with a warning (`REPLAY_BUSY_MAX_SHOW_MS`). That ceiling sends nothing and decides nothing about the replay. Reaching it means the gate reported a fact that never ended, which is a fault to find, or a search on a recording far longer than the six hours this is designed for, where the key goes back to its icon while the search runs on.
+- **A position jump's target outlives the replay being left**, by at most its jump's own wait in the gate: the larger of 3 s and twice the jump's length at 2048 frames a sim update, about 20 s across a six-hour recording (added 2026-10-13, from the gate's owner). A seek and the garage read the same in telemetry, so the gate cannot end it sooner without dropping a press held behind a real ten-second jump. A key whose jump was under way when the user left the replay therefore goes on showing working for up to that long and then shows not done.
 - **The timers are unreferenced**, so none holds the process open.
 - **A redraw that fails** (the host went away) is caught and logged at debug, and the next tick tries again or finds the key gone.
 - **While the flags overlay is flashing a key**, `setKeyImage` stores the image and does not send it, as for every other redraw. The flag wins.
@@ -233,7 +234,7 @@ For the maintainer; each has a proposal above.
 1. Each of the five cases under _What the user sees_.
 2. A search of ten seconds or more: the spinner steps evenly, the key does not flicker between frames, and the other keys on the page stay responsive.
 3. Turn the page while a key spins and turn back: it is spinning; turn back after the landing: it is at rest.
-4. Leave the replay for the car while a key spins: it returns to its icon.
+4. Leave the replay for the car while a search key spins: it returns to its icon. Leave it during a long position jump: the key goes on spinning for up to the jump's wait, then shows not done.
 5. A detent of the Replay Markers dial to a marker far away: the box shows the dots. A Frame Jog spin of several seconds: it does not.
 6. With the user's own colours, a hidden title and a border with glow on the key: the mark still reads.
 7. With a flag flying and the flags overlay on: the flag flashes, and the key is right when it clears.
