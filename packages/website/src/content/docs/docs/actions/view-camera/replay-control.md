@@ -3,7 +3,7 @@ title: Replay Control
 description: Full replay transport, speed, and navigation in a single configurable action.
 sidebar:
   badge:
-    text: "27 modes"
+    text: "28 modes"
     variant: tip
 ---
 
@@ -405,7 +405,7 @@ If the target car hasn't completed a lap yet, the press is a no-op (nothing move
 
 The replay lands just **before** the car takes the line, so you see the crossing into the timed lap. What it does from there is set by **Replay jump playback** in the [Settings window](/docs/getting-started/settings/#delays), on the **Delays** tab. With the default, **Remember state**, it carries on exactly as it was before the press: a paused replay stays paused just before the line, and a replay that was playing, in slow motion, fast-forwarding or rewinding continues at the same speed from there. **Play** always plays the lap at 1x — pick it if you want every press to start the lap — and **Stopped** always pauses just before the line. The Play / Pause key shows whichever state the jump left the replay in.
 
-How it gets there depends on whether iRaceDeck saw the lap happen. While the plugin runs during a live session it records the frame at which every car starts every lap into the session's replay record, so a press in the in-session replay — or in the saved replay opened days later — is a single jump straight to the recorded frame. iRacing covers a long jump in steps, so the button pauses the replay first if it was moving, waits until the replay has arrived, and only then switches the camera and leaves the replay as **Replay jump playback** says. It waits for as long as iRacing is still getting there, so a jump across hours of recording still lands. It gives up only when the replay has stopped short of the lap and stayed there for three seconds (or four times the **Fastest Lap Search Delay** below, if that is longer), and then leaves the replay paused where it stopped, whatever the setting says, rather than playing from the wrong spot. Without a record (the plugin wasn't running, someone else's replay, an offline session's replay opened later) the button searches the replay instead: it pauses, maps the sessions in the recording, bisects within the current one (≈ log₂ N jumps) and steps lap by lap to the line, then applies the setting the same way. Each search is followed by a settle gap before the next command, tunable in the [Settings window](/docs/getting-started/settings/#delays) on the **Delays** tab as **Fastest Lap Search Delay** (default 400 ms, range 50–1000 ms in 50 ms steps); slower computers and longer tracks may need a longer gap. The search remembers the frame it found, so the next press for that lap is a single jump. Pressing any other Replay Control key, or a Replay Markers jump, while the jump or the search is still running stops it: the replay is left where your command put it, and the setting is not applied on top of that.
+How it gets there depends on whether iRaceDeck saw the lap happen. While the plugin runs during a live session it records the frame at which every car starts every lap into the session's replay record, so a press in the in-session replay — or in the saved replay opened days later — is a single jump straight to the recorded frame. iRacing covers a long jump in steps, so the button pauses the replay first if it was moving, waits until the replay has arrived, and only then switches the camera and leaves the replay as **Replay jump playback** says. It waits for as long as iRacing is still getting there, so a jump across hours of recording still lands. It gives up only when the replay has stopped short of the lap and stayed there for three seconds (or four times the **Fastest Lap Search Delay** below, if that is longer), and then leaves the replay paused where it stopped, whatever the setting says, rather than playing from the wrong spot. Without a record (the plugin wasn't running, someone else's replay, an offline session's replay opened later) the button searches the replay instead: it pauses, maps the sessions in the recording, bisects within the current one (≈ log₂ N jumps) and steps lap by lap to the line, then applies the setting the same way. Each search is followed by a settle gap before the next command, tunable in the [Settings window](/docs/getting-started/settings/#delays) on the **Delays** tab as **Fastest Lap Search Delay** (default 400 ms, range 50–1000 ms in 50 ms steps); slower computers and longer tracks may need a longer gap. The search remembers the frame it found, so the next press for that lap is a single jump. A car is not on the track for the whole recording: it joins late, retires, or sits in the garage between runs. Where the search looks and finds the car gone it learns nothing, so it looks elsewhere in the session until it finds the car. Each jump, and each step from one session of the recording to the next, is waited for in proportion to its length, so one across hours of recording is not given up on while iRacing is still getting there. iRacing moves through a recording at about half an hour of it per second, and a search crosses the session about once. In a six-hour session that makes a search some fifteen seconds, about twenty-five when a session that long has to be crossed first to reach the one you are in, and up to a minute before it gives up on a car it cannot find. The key shows nothing while it works; pressing any other replay key stops it. If the search cannot find the lap, it puts the replay back as it was: on the frame and at the speed it had when you pressed, with the camera on the car you were watching. Pressing any other Replay Control key, or a Replay Markers jump, while the jump or the search is still running stops it: the replay is left where your command put it, and the setting is not applied on top of that.
 
 The lap record lives in the same per-app file as [Replay Markers](/docs/actions/view-camera/replay-markers/#where-markers-are-kept), so a record made while one deck app was running is used only by that app; another deck app has no record of that session and falls back to searching the replay.
 
@@ -422,6 +422,37 @@ Which driver's fastest lap the button jumps to. Defaults to **Viewed Car**.
 
 - **Viewed Car** — the car the replay camera is currently focused on
 - **Always my car** — your own car, regardless of where the camera is pointed (the camera also moves onto your car so the lap you jump to is what you actually see)
+
+---
+
+### Jump to Race Start
+
+Jump a race replay to five seconds before the green flag of the race start. On a standing start that shows the grid under the lights; on a rolling start, the field coming to the line. The camera is not changed, so you keep watching the car you chose.
+
+What the replay does once it has arrived is set by **Replay jump playback** in the [Settings window](/docs/getting-started/settings/#delays), on the **Delays** tab, exactly as for [Jump to Fastest Lap](#jump-to-fastest-lap). With the default, **Remember state**, it carries on as it was before the press: a paused replay stays paused five seconds before the green, and a replay that was playing continues at the same speed from there. **Play** always plays the start at 1x, and **Stopped** always pauses there.
+
+While a session runs live, iRaceDeck records the frame at which the race goes green, in the same per-session replay record that [Jump to Fastest Lap](#jump-to-fastest-lap) uses. With that record the press is a single jump, in the in-session replay and in a saved replay opened later alike. A saved replay lands about a second earlier, so roughly six seconds before the green. An offline session (an AI race or a test drive) keeps its record in memory only, for as long as the sim session lasts. Like the lap record, it is kept per deck app, so another deck app has no record of that session and uses the fallback below.
+
+Without a record — iRaceDeck was not running at the green, the replay file is someone else's, or the replay was recorded before iRaceDeck 3.6 — the press falls back to an approximation: five seconds before the pole car starts lap 1. When the lap record has that lap, which replays recorded by iRaceDeck 3.4 and 3.5 do, it is still a single jump. Otherwise the button searches the replay for it. That is the same search Jump to Fastest Lap falls back to, paced by the **Fastest Lap Search Delay** on the **Delays** tab of the [Settings window](/docs/getting-started/settings/#delays). The search briefly switches the camera to the pole car, and puts it back on the car you were watching once the replay has arrived. If the search cannot find that lap, it puts the replay back as it was, on the frame and at the speed it had when you pressed, with the camera back on your car. When the replay has no qualifying grid, or the pole sitter took no part in that race, the car the camera is on stands in for the pole car.
+
+The fallback lands close because the pole car takes the line first: its lap 1 starts a second or two after the green at most, and the five-second lead-in absorbs that. When the lap has to be searched for, iRacing's own lap search decides where lap 1 starts, and on a rolling start it puts that about a second before the green, so the replay lands about six seconds before it. Two cases are known to miss. A pole sitter who started from the pit lane crosses the line late, so the replay lands after the green. On a track whose standing-start grid sits well behind the timing line, it lands correspondingly early.
+
+In a replay with several sessions the button goes to the race. When the replay cursor is in a race session it uses that one, so inside a heat it goes to that heat's green. From practice, qualifying or a warmup it goes to the last race in the replay. If that race has not been run yet, as in the replay of a live event that is still in qualifying, the press looks through the recording, finds no race, and puts the replay back as it was: on the same frame, at the speed it had.
+
+The key turns grey only when the replay holds no race session at all, such as a practice-only or test-drive replay: grey colours and faded artwork, the same look [Replay Markers](/docs/actions/view-camera/replay-markers/#next-marker) keys have when a press would do nothing. A missing record does not grey the key, because the fallback can still land. From the car, with no replay open, a press does nothing, like every other Replay Control jump, and the key does not turn grey.
+
+A second press while a jump or a search is still running is ignored. Pressing any other Replay Control key, or a Replay Markers jump, stops it: the replay is left where that command put it, and a search stopped this way leaves the camera on the pole car.
+
+#### Details
+
+- **Method:** iRacing API
+- **Dial:** No rotation support
+- **Default binding:** No keyboard binding
+- **Telemetry-aware icon:** Yes — greyed out while the replay holds no race session
+
+#### Settings
+
+- No additional settings
 
 ---
 
@@ -580,12 +611,13 @@ What a short or long press of the dial button does, in either Mode, chosen from:
 - **Set 1x and Play** (default for **Long Press**) — plays forward at normal speed, whatever the replay was doing: the quick way out of a rewind, slow motion or pause.
 - **Reverse Direction** — flips the direction and keeps the speed: 4x becomes −4x, and 1/2x becomes −1/2x. While paused it flips the speed that **Play / Pause** will resume instead, and the replay stays paused — in Speed Control the caption changes direction at once.
 - **Jump to Live** — jumps to the live point in the session, exactly like the [Jump to Live](#jump-to-live) key.
+- **Jump to Race Start** — jumps to five seconds before the race start, exactly like the [Jump to Race Start](#jump-to-race-start) key, record, fallback and all. On a Mirabox knob, set **Press Action** to it to have the jump a race review starts from on the knob itself.
 - **None** — does nothing.
 
-A press is classified when you release the dial — a hold past the [Long-press threshold](/docs/features/dials/#the-long-press-threshold) fires the Long Press action. Hold past the threshold and the strip previews what letting go will do: `► 1x` for Set 1x and Play; `PAUSE`, or the speed it will resume (such as `► 4x`), for Play / Pause; the reversed speed (such as `◄ 4x`) for Reverse Direction; and `LIVE` for Jump to Live. From the car, where the release would do nothing, the strip stays as it is. See [Seeing the outcome before you let go](/docs/features/dials/#seeing-the-outcome-before-you-let-go). Long Press is Stream Deck+ only.
+A press is classified when you release the dial — a hold past the [Long-press threshold](/docs/features/dials/#the-long-press-threshold) fires the Long Press action. Hold past the threshold and the strip previews what letting go will do: `► 1x` for Set 1x and Play; `PAUSE`, or the speed it will resume (such as `► 4x`), for Play / Pause; the reversed speed (such as `◄ 4x`) for Reverse Direction; `LIVE` for Jump to Live; and `START` for Jump to Race Start. From the car, where the release would do nothing, the strip stays as it is, and so it does for Jump to Race Start in a replay with no race session. See [Seeing the outcome before you let go](/docs/features/dials/#seeing-the-outcome-before-you-let-go). Long Press is Stream Deck+ only.
 
 The remembered speed belongs to the dial: the Replay Control keys behave as before.
 
 #### Setting: Tap Display / Long Touch
 
-Optional touch-strip gestures (Stream Deck+ only), each over the same set { Play / Pause, Set 1x and Play, Reverse Direction, Jump to Live, None }. Both default to **None** for VR safety.
+Optional touch-strip gestures (Stream Deck+ only), each over the same set { Play / Pause, Set 1x and Play, Reverse Direction, Jump to Live, Jump to Race Start, None }. Both default to **None** for VR safety.

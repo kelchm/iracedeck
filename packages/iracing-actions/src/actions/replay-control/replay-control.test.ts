@@ -412,6 +412,7 @@ describe("ReplayControl", () => {
       "jump-to-live",
       "jump-to-my-car",
       "jump-to-fastest-lap",
+      "jump-to-race-start",
       "next-car",
       "prev-car",
       "next-car-number",
@@ -3330,7 +3331,7 @@ describe("ReplayControl", () => {
           }
         });
 
-        it("aborts past the settle timeout when a jump never lands, leaving the replay paused and the slot free", async () => {
+        it("aborts past the settle timeout when no jump lands, the way back included, leaving the replay paused and the slot free", async () => {
           vi.useFakeTimers();
 
           try {
@@ -3345,7 +3346,11 @@ describe("ReplayControl", () => {
             expect(action["logger"].warn).toHaveBeenCalledWith(
               "Jump to fastest lap: jump did not settle; aborting walk",
             );
-            expect(mockReplay.setPlayPosition).toHaveBeenCalledTimes(1);
+            // The probe, and the way back to the frame of the press (#1354), which does not land either.
+            expect(mockReplay.setPlayPosition.mock.calls.map((call) => call[1])).toEqual([expect.any(Number), 5000]);
+            expect(action["logger"].warn).toHaveBeenCalledWith(
+              "Jump to fastest lap: could not put the replay back; it is left paused where the search stopped",
+            );
             // Whatever the setting says (Play here), an aborted walk stays paused.
             expect(mockReplay.setPlaySpeed).not.toHaveBeenCalled();
             expect(action["replaySpeed"].get("ctx-1")).toBe(0);
@@ -3611,14 +3616,15 @@ describe("ReplayControl", () => {
 
           try {
             singleSessionBuffer(4, 4);
-            // The session restarts mid-walk: from the first probe on, every
+            // The session restarts mid-walk: from the first lap search on, every
             // sample carries a new SessionUniqueID under the same SessionNum.
             const settled = action["sdkController"].getCurrentTelemetry;
 
             action["sdkController"].getCurrentTelemetry = vi.fn(() => {
               const tel = settled() as any;
+              const lapSearches = mockReplay.nextLap.mock.calls.length + mockReplay.prevLap.mock.calls.length;
 
-              return mockReplay.setPlayPosition.mock.calls.length > 0 ? { ...tel, SessionUniqueID: 4 } : tel;
+              return lapSearches > 0 ? { ...tel, SessionUniqueID: 4 } : tel;
             });
 
             await action.onWillAppear(fakeEvent("ctx-1", { mode: "jump-to-fastest-lap" }) as any);
@@ -3630,6 +3636,43 @@ describe("ReplayControl", () => {
             );
             expect(mockStore.laps.recordLapStart).not.toHaveBeenCalled();
             expect(mockReplay.setPlaySpeed).toHaveBeenCalledExactlyOnceWith(1, false);
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+
+        it("a probe that reads another session drops the session map and puts the replay back (#1354)", async () => {
+          vi.useFakeTimers();
+
+          try {
+            singleSessionBuffer(4, 4);
+            // From the first probe on, every sample carries another SessionUniqueID:
+            // the bounds the map gave do not describe this recording.
+            const settled = action["sdkController"].getCurrentTelemetry;
+
+            action["sdkController"].getCurrentTelemetry = vi.fn(() => {
+              const tel = settled() as any;
+              const probing = mockReplay.setPlayPosition.mock.calls.length === 1;
+
+              return probing ? { ...tel, SessionUniqueID: 4 } : tel;
+            });
+
+            await action.onWillAppear(fakeEvent("ctx-1", { mode: "jump-to-fastest-lap" }) as any);
+            await action.onKeyDown(fakeEvent("ctx-1", { mode: "jump-to-fastest-lap" }) as any);
+            await vi.runAllTimersAsync();
+
+            expect(action["logger"].warn).toHaveBeenCalledExactlyOnceWith(
+              expect.stringContaining("read session 2/4; the session map does not match the recording, aborting"),
+            );
+            expect(_getFastestLapSessionCache()).toBeNull();
+            // One probe, then the way back to the frame of the press; no lap search, nothing recorded.
+            expect(mockReplay.setPlayPosition.mock.calls.map((call) => call[1])).toEqual([expect.any(Number), 5000]);
+            expect(mockReplay.nextLap).not.toHaveBeenCalled();
+            expect(mockReplay.prevLap).not.toHaveBeenCalled();
+            expect(mockStore.laps.recordLapStart).not.toHaveBeenCalled();
+            expect(action["logger"].info).toHaveBeenCalledWith(
+              "Jump to fastest lap: replay put back where the press found it",
+            );
           } finally {
             vi.useRealTimers();
           }
@@ -4070,7 +4113,8 @@ describe("ReplayControl", () => {
               "Jump to fastest lap: nextSession #1 moved the cursor but it never settled; aborting",
             );
             expect(_getFastestLapSessionCache()).toBeNull();
-            expect(mockReplay.setPlayPosition).not.toHaveBeenCalled();
+            // No probe: the one seek is the way back to the frame of the press (#1354).
+            expect(mockReplay.setPlayPosition.mock.calls.map((call) => call[1])).toEqual([5000]);
             expect(mockReplay.setPlaySpeed).not.toHaveBeenCalled();
             expect(mockStore.laps.recordLapStart).not.toHaveBeenCalled();
           } finally {
@@ -4615,7 +4659,7 @@ describe("ReplayControl", () => {
           );
 
           it.each<ReplayJumpPlayback>(["remember", "play"])(
-            "%s: an aborted walk stays paused where it stopped",
+            "%s: an aborted walk whose way back does not land stays paused where it stopped",
             async (mode) => {
               setJumpPlayback(mode);
               singleSessionBuffer(4, 4);

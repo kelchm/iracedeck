@@ -26,18 +26,19 @@
 
 ## Features
 
-**33 actions** with **265+ modes** across 9 categories:
+**33 actions** with **265+ modes** across 10 categories:
 
 | Category                | Actions | Modes | Examples                                                              |
 | ----------------------- | ------- | ----- | --------------------------------------------------------------------- |
-| **Display & Session**   | 2       | 10    | Incidents, laps, position, iRating, gaps ahead/behind, fuel, flags    |
-| **Driving Controls**    | 6       | 32    | AI spotter, audio (incl. Race Engineer & Radar volume), black box cycling, look direction, car control, pit crew |
-| **Cockpit & Interface** | 5       | 35    | Wipers, FFB, splits & reference, telemetry, UI toggles                |
-| **View & Camera**       | 6       | 95    | FOV, replay, replay markers, camera controls, broadcast tools         |
+| **Audio & Voice**       | 3       | 15    | AI spotter, audio (incl. Race Engineer & Radar volume), pit crew      |
+| **Display & Session**   | 2       | 15    | Incidents, laps, position, iRating, gaps ahead/behind, fuel, flags    |
+| **Driving Controls**    | 3       | 21    | Black box cycling, look direction, car control                        |
+| **Cockpit & Interface** | 5       | 32    | Wipers, FFB, splits & reference, telemetry, UI toggles                |
+| **View & Camera**       | 6       | 97    | FOV, replay, replay markers, camera controls, broadcast tools         |
 | **Media**               | 1       | 7     | Video recording, screenshots                                          |
 | **Pit Service**         | 3       | 15    | Fuel (button and dial), tires, compounds, tearoff, fast repair        |
 | **Car Setup**           | 7       | 44    | Brakes (button and dial), chassis, aero, engine, fuel mix, hybrid/ERS, traction control |
-| **Communication**       | 2       | 34    | Chat, macros, whisper, reply, race admin commands                     |
+| **Communication**       | 2       | 35    | Chat, macros, whisper, reply, race admin commands                     |
 | **Stream Deck**         | 1       | 1     | Switch to bundled iRaceDeck profiles (Elgato only)                    |
 
 **Key highlights:**
@@ -115,7 +116,7 @@ packages/
   deck-core/               Platform-agnostic base classes, types, and shared utilities
   settings/                Global settings below the deck layer: schema, settings store, migrations, PI warnings
   voice-packs/             Race Engineer voice packs: scanner, catalog, installer, launch step, voice labels
-  replay-store/            Per-session replay store: replay markers and the lap record, one file per session
+  replay-store/            Per-session replay store: replay markers, the lap record and the greens, one file per session
   diagnostics/             Self-diagnostics: main-thread watchdog, resource monitor, CPU profile capture, Telemetry Snapshot state sections
   app-updates/             Version-upgrade changelog opener and the What's New update check
   settings-window/         Settings window plugin side: loopback server and guard, launcher, commands
@@ -144,7 +145,7 @@ packages/
 | `@iracedeck/deck-core`            | Base classes, types, keyboard service, icon templates; sim-neutral through `SimConnection` |
 | `@iracedeck/settings`             | Global settings below the deck layer: the schema and cache, migrations, the plugin-owned settings store, run-scoped keys, PI warnings, first run and the startup gates; deck-core re-exports none of them |
 | `@iracedeck/voice-packs`          | The Race Engineer voice-pack stack: the scanner and voice-pack service, the catalog, download, extraction and installer, the launch step that keeps the `default` pack installed, the voice labels; deck-core re-exports none of it |
-| `@iracedeck/replay-store`         | The per-session replay store: replay markers and the lap record, one file per `SubSessionID`, debounced atomic writes; deck-core re-exports none of it |
+| `@iracedeck/replay-store`         | The per-session replay store: replay markers, the lap record and the greens, one file per `SubSessionID`, debounced atomic writes; deck-core re-exports none of it |
 | `@iracedeck/diagnostics`          | The plugin's self-diagnostics: the main-thread watchdog, the resource monitor, the CPU profile capture, and the registry of plugin-state sections a Telemetry Snapshot records, with its JSON-safe encoder |
 | `@iracedeck/app-updates`          | The version-upgrade changelog opener and the settings window's update check: the published-changelog feed, its sanitizer, the cached service |
 | `@iracedeck/settings-window`      | The settings window's plugin side: the loopback server and its request guard, the controller, the app-window launcher, the command handler, the settings-channel publisher |

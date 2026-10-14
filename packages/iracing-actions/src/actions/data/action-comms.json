@@ -3299,6 +3299,9 @@
     "jump-to-fastest-lap": {
       "method": "api"
     },
+    "jump-to-race-start": {
+      "method": "api"
+    },
     "next-car-number": {
       "method": "api"
     },
@@ -3340,6 +3343,9 @@
       "method": "api"
     },
     "jump-to-live": {
+      "method": "api"
+    },
+    "jump-to-race-start": {
       "method": "api"
     }
   },
