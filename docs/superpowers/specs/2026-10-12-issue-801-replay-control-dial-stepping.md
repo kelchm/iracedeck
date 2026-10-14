@@ -64,7 +64,7 @@ What surrounds those three:
 - **When the sign is wrong.** The 400 ms is a patience in the gate and nothing correct rests on it here either: on a machine that carries a search out later than that, the run ends as found nothing and the search then lands by itself. The step that was turned for has happened, the rest of the count is dropped, and nothing was sent bare. The gate's record of the search stands until a landing or a jump, so a key pressed meanwhile is still placed safely.
 - **A runner that starts behind a jump or a key's search** takes the paused path: what it inherits has paused the replay or has to be settled first.
 
-**Not done here: every step of a run on the playing replay.** That would end a spin past the end of a list in under half a second too, and needs no patience at all. It rests on three things nobody has measured: when a search sent straight after another stalls the frame (the 400 ms sign was measured for lone searches, a follow-on search is carried out about 400 ms after the landing before it, and a slower machine cannot be settled from the maintainer's), chained Previous steps on a replay playing forwards, and small leaps at fast-forward. It also forks steps 2, 4 and 5 in two. It is a follow-up issue. The runner here is written with one function that returns a search's outcome, so that issue adds an outcome and a start branch and does not rewrite it.
+**Not done here: every step of a run on the playing replay.** That would end a spin past the end of a list in under half a second too, and needs no patience at all. It rests on three things nobody has measured: when a search sent straight after another stalls the frame (the 400 ms sign was measured for lone searches, a follow-on search is carried out about 400 ms after the landing before it, and a slower machine cannot be settled from the maintainer's), chained Previous steps on a replay playing forwards, and small leaps at fast-forward. It also forks steps 2, 4 and 5 in two. It is [#1439](https://github.com/niklam/iracedeck/issues/1439). The runner here is written with one function that returns a search's outcome, so that issue adds an outcome and a start branch and does not rewrite it.
 
 ## Incident
 
@@ -134,7 +134,7 @@ Every mode but Car ends in the sim moving its own cursor, and the durations this
 - **Next / Previous Green** as a stepping target (#1354's designed extension).
 - **Changing what the keypad's searches do to playback.**
 - **A setting** for the search limit, the pacing or the patience. The patience's floor is the walk's wait, which the Fastest Lap Search Delay setting already tunes for a slow machine; its cap and the hold are fixed.
-- **A paced search further away than the patience**, other than as the first step on a playing replay, and every step of a run on the playing replay (a follow-up issue, _The paced search_).
+- **A paced search further away than the patience**, other than as the first step on a playing replay, and every step of a run on the playing replay ([#1439](https://github.com/niklam/iracedeck/issues/1439), _The paced search_).
 - **The keypad's car keys and Camera Controls' dial during a jump.** Their taps go out at once as today and are lost while a seek runs. That is #1435 and is not folded in here.
 - **Ulanzi.** No Ulanzi dial is declared until its dials are verified (rule 7).
 
