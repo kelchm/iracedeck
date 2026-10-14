@@ -221,6 +221,7 @@ Still unmeasured, and covered by the read-backs and not by any number here: a sl
 - **Knowing beforehand that a search will find nothing.** Next Session in the last session can be told from telemetry before it is sent, and would spare a paused replay its wait. Not done here.
 - **Putting slow motion back after a search on a quiet replay.** iRacing clears it, as it does today.
 - **What a key shows while its press waits** (#1437, built on the state seam).
+- **The gate's record in the Telemetry Snapshot** (#1442). The record has its getter; writing it into a snapshot is a plugin-state section of its own, filed separately (maintainer, 2026-10-14).
 - **Ulanzi dials**, which are not declared.
 
 ## Testing
