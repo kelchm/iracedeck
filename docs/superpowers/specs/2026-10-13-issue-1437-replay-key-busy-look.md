@@ -100,6 +100,7 @@ How A is built:
 - **The marks are drawn in code**, in `@iracedeck/icon-composer` beside the binding-missing glyph, from circles, lines and opacity only. They need no filter, so they survive the `pngRasterization` kill-switch, and they add no icon file, preview or `icon-defaults.json` entry.
 - **They take the key's own colours**: the mark in `graphic1Color`, falling back to `textColor`, on the user's background. The red of not done is the fixed semantic red (`#e74c3c`), as on every other key.
 - **A key with its title hidden** shows the mark alone. It is the key that was just pressed, for a few seconds.
+- **The mark is no larger than on a titled key** (amended 2026-10-17, from the maintainer's hands-on test: "On Jump to Fastest lap (doesn't have a title) the spinner looks too big. It should be smaller. On buttons with text it looks good."). A key with no title, or its title hidden, has the whole 128-unit square as its artwork area, and a ring filling it read as too big. The mark is laid out in a square of at most 84 units, the area a default two-line title leaves, centred where the artwork sits, so the ring is about 82 units across and the cross about 76 on every key.
 - **`assembleIcon` takes the mark as an option**, as it takes `bindingMissing` and `dimmed`. Replay Control's hand-assembled Set Speed icon calls the same mark function. Speed Display sends no replay command, so it never shows a mark (amended 2026-10-17).
 
 ## Frame rate and cost
