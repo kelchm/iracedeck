@@ -91,7 +91,9 @@ import { diffPitsOpen } from "./diff/pits-open.js";
 import { updatePositionTracking } from "./diff/race-finish.js";
 import { diffRadar, resolveRadarState } from "./diff/radar.js";
 import { diffReplayGreens } from "./diff/replay-greens.js";
+import { diffReplayIncidents } from "./diff/replay-incidents.js";
 import { diffReplayLaps } from "./diff/replay-laps.js";
+import { diffReplaySessions } from "./diff/replay-sessions.js";
 import { diffRollingStart } from "./diff/rolling-start.js";
 import { updateStallVisit } from "./diff/stall-visit.js";
 import { diffStartCountdown, diffStartLights } from "./diff/start-lights.js";
@@ -1890,8 +1892,9 @@ function handleDisconnect(self: TranslatorInstance): void {
  * would re-seed its ceiling lower and drop a mark at the flip boundary. The
  * flag seed deliberately leaves these fields alone. A genuine session change
  * still clears them (`resetPerSessionState` wipes without preservation), so
- * neither cluster can leak into the next session — with one exception, the
- * last stop's tire temperatures (issue #254), which that wipe carries over too.
+ * neither cluster can leak into the next session — with two exceptions, the
+ * last stop's tire temperatures (issue #254) and the replay session record
+ * (issue #1426), which that wipe carries over too.
  */
 function wipeStateForReplay(self: TranslatorInstance): void {
   const preservedAcrossReplay = {
@@ -2084,6 +2087,17 @@ function wipeStateForReplay(self: TranslatorInstance): void {
     // session state and flags of the tick before a replay say nothing about
     // the tick after it, and an edge read across the two would put a frame in
     // the file for a green nobody watched. Its pre-guard diff re-seeds too.
+    // The replay incident record's baselines (issue #1426,
+    // `replayIncidents*`) are NOT preserved, for the lap record's reason.
+    //
+    // The replay session record (issue #1426) IS preserved, unlike its
+    // siblings: it records from out-of-car ticks at the live edge, which are
+    // replay ticks, so a replay edge says nothing about its run, and its
+    // published list must outlive every trip between the car and the garage
+    // or each one would publish the session's start again.
+    replaySessionsCandidate: self.state.replaySessionsCandidate,
+    replaySessionsPublished: self.state.replaySessionsPublished,
+    replaySessionsLatestStart: self.state.replaySessionsLatestStart,
   };
 
   self.state = createInitialState();
@@ -2128,6 +2142,10 @@ function wipeStateForReplay(self: TranslatorInstance): void {
  * capture starts its race on the values the previous session left — so what
  * that read finds is the run's own refresh, or nothing.
  *
+ * The replay session record (`replaySessions*`, issue #1426) is carried over
+ * too: it is a record of every session the connection has seen, not of this
+ * one, and a pair it has published must never be published again.
+ *
  * Track-level instance fields (`pitSpeedLimitMps` / `pitSpeedLimitKey`) self-
  * invalidate via `resolvePitSpeedLimit`'s `${TrackID}|${SessionNum}` cache key
  * and need no reset here.
@@ -2144,6 +2162,13 @@ function resetPerSessionState(self: TranslatorInstance, telemetry: TelemetryData
   const preservedAcrossSessions = {
     lastStopTireTemps: self.state.lastStopTireTemps,
     tireTempsOnCircuit: self.state.tireTempsOnCircuit,
+    // The replay session record (issue #1426): a session change is exactly
+    // when its next pair arrives, and the pairs already published must stay
+    // published. Its run is keyed by the pair, so the old one cannot agree
+    // with the new session's first reading.
+    replaySessionsCandidate: self.state.replaySessionsCandidate,
+    replaySessionsPublished: self.state.replaySessionsPublished,
+    replaySessionsLatestStart: self.state.replaySessionsLatestStart,
   };
 
   self.state = createInitialState();
@@ -2223,8 +2248,8 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
   // the ~300 ms false blip after every replay seek is not a trip to live, and
   // it is true throughout a saved replay (`SimMode === "replay"`), whatever
   // the flag reads. The guard below, `diffFirstOnTrack` and the replay
-  // recorders (`diffReplayLaps`, `diffReplayGreens`) read it; the
-  // `session.changed` paths and `diffStartCountdown` deliberately
+  // recorders (`diffReplayLaps`, `diffReplayGreens`, `diffReplaySessions`,
+  // `diffReplayIncidents`) read it; the `session.changed` paths and `diffStartCountdown` deliberately
   // do not gate on the replay view at all (#568, #829) and read only the
   // `SimMode` discriminator, as before.
   const replayState = self.controller.getReplayState();
@@ -2433,6 +2458,43 @@ function handleTick(self: TranslatorInstance, telemetry: TelemetryData): void {
     inReplay,
     (ev) => publish(self, ev, telemetry, Date.now()),
     self.logger,
+  );
+
+  // The replay session record (issue #1426) runs pre-guard beside the two
+  // above, on the second class of tick the recorders' gate knows
+  // (`resolveReplayLiveTick`): in the car, or out of it at the live edge of
+  // the in-session replay, which is how a session that begins while the
+  // driver sits in the garage still gets its start. So, unlike them, it
+  // records from some of the ticks the guard swallows, and its state is
+  // PRESERVED by `wipeStateForReplay` (and by `resetPerSessionState`, which
+  // runs above it on a session-change tick): the published list is what keeps
+  // a session from going out again after every trip to the garage. It reads
+  // the controller's saved-replay answer (`replayState.replayOnlySession`),
+  // not this tick's `replayOnlySession`: that one reads false on any tick
+  // whose session info is null, while the controller keeps its answer through
+  // such a tick, and at the end of a saved replay's tape the out-of-car gate
+  // would otherwise take the tick as the live edge of a live session.
+  diffReplaySessions(
+    self.state,
+    telemetry,
+    self.controller.getSessionInfo() as Record<string, unknown> | null,
+    inReplay,
+    replayState.replayOnlySession,
+    (ev) => publish(self, ev, telemetry, Date.now()),
+    self.logger,
+  );
+
+  // The replay incident record (issue #1426) is the lap and green records'
+  // sibling: the same in-car gate, pre-guard for the same reason (an
+  // ineligible tick must unseed it, so a count that rose behind the replay
+  // view is not stamped with the frame the driver came back on), and its
+  // state is in `wipeStateForReplay`'s wiped set like theirs.
+  diffReplayIncidents(
+    self.state,
+    telemetry,
+    self.controller.getSessionInfo() as Record<string, unknown> | null,
+    inReplay,
+    (ev) => publish(self, ev, telemetry, Date.now()),
   );
 
   // `driver.firstOnTrack` is detected on every tick — including replay ticks
