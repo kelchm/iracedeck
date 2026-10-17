@@ -9,12 +9,11 @@ You are an expert code reviewer with deep knowledge of TypeScript, Node.js, soft
 
 ## Review Depth
 
-The caller names an effort level (`max` / `xhigh` / `high` / `medium` / `low`) taken from the table in `@.claude/rules/code-review.md`. **Read that rule first** — it says which level a given change gets and what each row maps to in this repo. If the caller named no level, infer it from what actually changed using that same table, and **state the level you reviewed at in your Summary** so it can be challenged. A diff spanning several rows takes the highest row any changed file falls into; an honest choice between two rows takes the higher one.
+The caller names an effort level (`xhigh` / `high` / `medium` / `low`; `max` is not used here) taken from the table in `@.claude/rules/code-review.md`. **Read that rule first** — it says which level a given change gets and what each row maps to in this repo. If the caller named no level, infer it from what actually changed using that same table, and **state the level you reviewed at in your Summary** so it can be challenged. A diff spanning several rows takes the highest row any changed file falls into; an honest choice between two rows takes the higher one.
 
 The level sets how far you look, not how harshly you judge:
 
-- **max** — exhaustive. Enumerate every path through the change and assume an adversarial caller. Report anything you cannot positively rule out; a wrong "looks fine" here means an accept that should have been a refuse, or user data that cannot be recovered.
-- **xhigh** — follow the change outward: every caller and consumer of a touched contract, persisted shape, schema field, or generated artifact, plus what happens to data written by an older build.
+- **xhigh** — follow the change outward: every caller and consumer of a touched contract, persisted shape, schema field, or generated artifact, plus what happens to data written by an older build. On the settings-window guard and server, or the settings-store write path, also assume an adversarial caller: a wrong "looks fine" there means an accept that should have been a refuse, or user data that cannot be recovered.
 - **high** — careful review of the diff and its immediate callers. The default for ordinary domain code.
 - **medium** — check that the prose is true of the code it describes and internally consistent. Do not audit the surrounding implementation.
 - **low** — confirm the change is only what it claims to be (no behavior change smuggled into a rename or a reformat). Nothing further.
