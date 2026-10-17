@@ -64,7 +64,8 @@ One thing never reaches the gate: a press the action ignores itself because a fa
 | Waiting | Waiting, at once |
 | Both | Waiting |
 | A fact ended as completed or superseded | Its ordinary icon, at once |
-| A fact ended as gave up, for any reason | Not done for one second, at once, then its ordinary icon |
+| A fact ended as gave up, other than by the replay being left or the sim disconnecting | Not done for one second, at once, then its ordinary icon |
+| A fact ended as gave up because the replay was left (`replay-left`) or the sim disconnected (`disconnected`) | Its ordinary icon, at once |
 | The action ignored the press | Not done for one second, unless the key is already showing working |
 | Nothing | Its ordinary icon |
 
@@ -74,6 +75,7 @@ One thing never reaches the gate: a press the action ignores itself because a fa
 - **One drawing whether or not telemetry shows the search.** The gate's view says whether a search is seen or only possible. The key does not claim to know more than the gate, and the two differ only in when they end.
 - **A search with nothing to find on a paused replay** shows working until the time its distance could take has passed, then not done. Deep in a six-hour recording that is up to about 20 s of spinner on, say, Next Incident with no incident ahead. It is the honest drawing of what the gate believes. A press made meanwhile is held until that same moment unless it is pressed again. Left alone, it takes over when the search's time is up: the search's key shows not done and the waiting key returns to its icon and acts, in one notice. Pressed again, it acts at once, and the search's key returns to its icon with nothing shown, since the user's own press ended it.
 - **Superseded shows nothing.** The user's own newer press is the reason, and that key now carries the look.
+- **Leaving the replay or losing the sim shows nothing either** (amended 2026-10-17, from the code review). The gate files both under gave up, but neither says the press failed: Jump to Live in a live session ends its own search by leaving the replay, which is the press done, and a search key spinning when the user goes back to the car has simply stopped mattering. A position jump whose target outlives the replay being left ends later, when its own wait runs out, and that does show not done.
 - **Not done is drawn at once**, like the other two. It is the answer to the press: no next incident, the search found no lap, the jump ended somewhere else.
 
 ## Which surface is "the pressed key"
@@ -98,7 +100,7 @@ How A is built:
 - **The marks are drawn in code**, in `@iracedeck/icon-composer` beside the binding-missing glyph, from circles, lines and opacity only. They need no filter, so they survive the `pngRasterization` kill-switch, and they add no icon file, preview or `icon-defaults.json` entry.
 - **They take the key's own colours**: the mark in `graphic1Color`, falling back to `textColor`, on the user's background. The red of not done is the fixed semantic red (`#e74c3c`), as on every other key.
 - **A key with its title hidden** shows the mark alone. It is the key that was just pressed, for a few seconds.
-- **`assembleIcon` takes the mark as an option**, as it takes `bindingMissing` and `dimmed`. Replay Control's two hand-assembled icons (Speed Display, Set Speed) call the same mark function.
+- **`assembleIcon` takes the mark as an option**, as it takes `bindingMissing` and `dimmed`. Replay Control's hand-assembled Set Speed icon calls the same mark function. Speed Display sends no replay command, so it never shows a mark (amended 2026-10-17).
 
 ## Frame rate and cost
 
