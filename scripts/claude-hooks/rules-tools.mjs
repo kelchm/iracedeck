@@ -6,12 +6,13 @@
  */
 import path from "node:path";
 
-const LEVELS = ["max", "xhigh", "high", "medium", "low"];
+const LEVELS = ["xhigh", "high", "medium", "low"];
 
 /**
  * `/code-review` must name its effort level, target the ir-<issue> worktree
  * by absolute path (the session cwd is the master checkout), and never carry
- * `--fix`. See .claude/rules/code-review.md.
+ * `--fix`. `max` is not used: `xhigh` is the top level (Niklas, 2026-10-17).
+ * See .claude/rules/code-review.md.
  */
 export function checkSkill({ skill, args = "" }, cwd = "") {
   if (!/(^|:)code-review$/.test(skill ?? "")) return null;
@@ -20,6 +21,8 @@ export function checkSkill({ skill, args = "" }, cwd = "") {
     return "Never run /code-review with --fix: findings are candidates, not verdicts. Report only, then apply the ones that hold by hand.";
   if (/(^|\s)ultra(\s|$)/.test(a)) return null; // the cloud review is the maintainer's to launch, and it bundles the branch itself
   const wordsIn = a.split(/\s+/).filter(Boolean);
+  if (wordsIn.includes("max"))
+    return "Never run /code-review at max: xhigh is the top level here, and max is not used (.claude/rules/code-review.md). Use xhigh.";
   if (!wordsIn.some((w) => LEVELS.includes(w)))
     return `State the effort level explicitly (${LEVELS.join(" / ")}) — a bare call silently reuses the last level typed.`;
   const targetsWorktree = /[\\/]ir-\d+/.test(a) || /^ir-\d+$/.test(path.basename(cwd));

@@ -15,6 +15,14 @@ describe("checkSkill (/code-review)", () => {
     expect(checkSkill({ skill: "code-review", args: `high ${TREE} --fix` }, MASTER)).toMatch(/--fix/));
   it("requires a level", () =>
     expect(checkSkill({ skill: "code-review", args: TREE }, MASTER)).toMatch(/effort level/));
+  it("refuses max, even with a path and scope block", () =>
+    expect(checkSkill({ skill: "code-review", args: `max ${TREE}\n\nSCOPE:\n- x` }, MASTER)).toMatch(
+      /xhigh is the top/,
+    ));
+  it("accepts xhigh as the top level", () =>
+    expect(checkSkill({ skill: "code-review", args: `xhigh ${TREE}` }, MASTER)).toBeNull());
+  it("does not list max among the levels it asks for", () =>
+    expect(checkSkill({ skill: "code-review", args: TREE }, MASTER)).not.toMatch(/max/));
   it("requires the worktree when the cwd is master", () =>
     expect(checkSkill({ skill: "code-review", args: "high" }, MASTER)).toMatch(/worktree/));
   it("accepts a cwd that is itself an ir-<issue> tree", () =>
