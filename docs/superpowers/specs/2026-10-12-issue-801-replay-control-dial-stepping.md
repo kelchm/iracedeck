@@ -8,14 +8,14 @@ Four more modes on the dial that #1316 and #1317 build (`2026-10-04-issue-1316-r
 
 ## The decision
 
-The dial's Mode select gains **Lap**, **Session**, **Incident** and **Car**. Everything the surface owns is unchanged and shared: the press and gesture slots, the remembered-speed Play / Pause, the in-replay guard, the throttle and the dash box.
+The dial's Mode select gains **Lap**, **Session**, **Incident** and **Track Order** (named Car until the maintainer's second test round, 2026-10-18: it is Camera Controls' Track Order rotation, so it takes that name and its stored value `track-order`; nothing had shipped under `car`). Everything the surface owns is unchanged and shared: the press and gesture slots, the remembered-speed Play / Pause, the in-replay guard, the throttle and the dash box.
 
 | Mode | A detent | How |
 | --- | --- | --- |
 | Lap | the viewed car's next / previous lap | #1426's record step, else iRacing's search |
 | Session | the next / previous session | #1426's record step, else iRacing's search |
 | Incident | the next / previous incident | iRacing's search |
-| Car | the next / previous car on track | iRacing's Next Car / Previous Car bindings |
+| Track Order | the next / previous car on track | iRacing's Next Car / Previous Car bindings |
 
 Clockwise is next in all four. Lap, Session and Incident are ordered by time in the recording and Car is iRacing's own Next Car, the car ahead, so none of them is a number-primary rotation and none flips (`encoders-and-touchscreen.md` rule 4).
 
@@ -85,12 +85,19 @@ A camera switch in the middle of a fastest-lap walk would point its search at an
 
 ## The display
 
-| | Lap | Session | Incident | Car |
+Amended 2026-10-18 from the maintainer's second test round (the first showed the lap as `L12` over the play state):
+
+| | Lap | Session | Incident | Track Order |
 | --- | --- | --- | --- | --- |
-| Label | `LAP` | `SESSION` | `INCIDENT` | `CAR` |
-| Value | the viewed car's lap at the cursor, `L12` | the cursor's session, `RACE` | replay time, `m:ss` | the viewed car, `#12` |
-| Caption | play state | play state | play state | play state |
+| Label | `LAP` | `SESSION` | `INCIDENT` | `TRACK ORDER` |
+| Value | the viewed car's lap at the cursor over the laps in that session, `12/25` | the cursor's session, `RACE` | replay time, `m:ss` | the viewed car, `#12`, flanked by the car numbers ahead and behind where they can be trusted |
+| Caption | the replay time, `m:ss` | the viewed car's `12/25`, as Lap's value | none | none |
 | Side marks | lit where a turn that way has somewhere to go | the same | both lit | both lit |
+
+- **While a paced search runs**, its pending count (`+3`, `-2`) takes the caption in Lap, Session and Incident: the count is progress.
+- **The laps in the session** (maintainer, 2026-10-18): the session's scheduled laps (`SessionInfo.Sessions[n].SessionLaps`) when it is a number; for an unlimited session (practice, qualifying, a timed race) the laps the viewed car completed in it, from the session's results (`ResultsPositions[].LapsComplete`) once it has some, else the highest lap the record holds for that car in it; with none of these, no denominator (`12`). Without the record the current lap is unknown, so the value reads `--/25`, or `--`.
+- **Track Order's neighbours** (maintainer, 2026-10-18, the third of three options put to him): the car numbers on track ahead and behind, as Camera Controls' Car # mode flanks its car, shown only where the per-car track positions are the replay's own: in a saved replay, and at the live edge of an in-session replay. Scrubbed back in an in-session replay those arrays read the live field (#1281's capture), so there the car number shows alone. The preview can still differ from where iRacing's binding lands (the pace car is a stop of iRacing's own, #1277); that is accepted. With no caption the value keeps the size and place it has in the other modes.
+- **Long Press** (maintainer, 2026-10-18): a new gesture value `mode-default`, labelled Mode default, is Long Press's default. It runs **Jump to My Car** (Replay Control's keypad mode, now also a gesture option in every slot) in Track Order and Set 1x and Play in every other mode; a specific pick applies in every mode. It extends the stored `REPLAY_DIAL_GESTURES` enum. Long Press is Stream Deck+ only.
 
 - **The lap comes from the record, not from `CarIdxLap`.** The maintainer's first choice was the viewed car's lap counter. In an in-session replay the per-car arrays read the live field: four snapshots (2026-09-28 and 2026-09-29) scrubbed back to moments when the camera car was racing all read `CarIdxLap` −1. The record's entry at the cursor is the lap actually on screen, and the maintainer agreed to read it from there (2026-10-12). With no entry for that car at the cursor the value is the replay time, as in Incident.
 - **The session name** is `SessionInfo.Sessions[ReplaySessionNum].SessionType`, upper-cased and fitted by the box.
