@@ -3333,6 +3333,25 @@
     "frame-jog": {
       "method": "api"
     },
+    "lap": {
+      "method": "api"
+    },
+    "session": {
+      "method": "api"
+    },
+    "incident": {
+      "method": "api"
+    },
+    "track-order": {
+      "method": "keybind",
+      "binding": {
+        "scope": "global",
+        "keys": [
+          "replayControlNextCar",
+          "replayControlPrevCar"
+        ]
+      }
+    },
     "play-pause": {
       "method": "api"
     },
@@ -3346,6 +3365,12 @@
       "method": "api"
     },
     "jump-to-race-start": {
+      "method": "api"
+    },
+    "jump-to-my-car": {
+      "method": "api"
+    },
+    "mode-default": {
       "method": "api"
     }
   },

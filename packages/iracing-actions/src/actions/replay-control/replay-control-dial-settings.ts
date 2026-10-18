@@ -10,20 +10,31 @@ import z from "zod";
 import { dialAppearanceFields } from "../../shared/dial-box.js";
 
 /**
- * What the dial's rotation does: Speed Control (#1316) or Frame Jog (#1317).
- * `dial.mode` is dial-only; the keypad's `mode` is ignored on a dial.
+ * What the dial's rotation does: Speed Control (#1316), Frame Jog (#1317), or
+ * Lap, Session, Incident and Track Order stepping (#801). `dial.mode` is dial-only;
+ * the keypad's `mode` is ignored on a dial. A value this build does not know
+ * reads as Speed Control, and nothing is migrated.
  */
-export const REPLAY_DIAL_MODES = ["speed", "frame-jog"] as const;
+export const REPLAY_DIAL_MODES = ["speed", "frame-jog", "lap", "session", "incident", "track-order"] as const;
 
 export type ReplayControlDialMode = (typeof REPLAY_DIAL_MODES)[number];
 
-/** What a dial gesture slot can run. Shared by every dial mode, so changing the Mode never changes the presses. */
+/**
+ * What a dial gesture slot can run. Shared by every dial mode, so changing the
+ * Mode never changes a specific pick. `mode-default` (#801, Long Press's
+ * default since the maintainer's second test round) is the one value that
+ * follows the Mode: Jump to My Car in Track Order and Set 1x and Play in
+ * every other mode, resolved when the gesture runs (`resolveDialGesture`). A
+ * stored value: an unknown one reads as its slot's default.
+ */
 export const REPLAY_DIAL_GESTURES = [
+  "mode-default",
   "play-pause",
   "set-1x-play",
   "reverse",
   "jump-to-live",
   "jump-to-race-start",
+  "jump-to-my-car",
   "none",
 ] as const;
 
@@ -118,8 +129,9 @@ function dialGestureField(fallback: ReplayControlDialGesture) {
  * The dial's settings. Every field defaults and `.catch`es to its default, so
  * a keypad instance (no `dial` at all) and a fresh dial both parse to a full
  * object and one bad field never resets the others. Press is Play/Pause; Long
- * press sets 1x and plays (also assignable to Press, for a knob that has no
- * long press); the touch slots default to None (rule 5).
+ * press is the Mode default (#801): Jump to My Car in Track Order, Set 1x and
+ * Play in every other mode, and every gesture is also assignable to Press, for
+ * a knob that has no long press; the touch slots default to None (rule 5).
  */
 export const ReplayControlDialSettings = z
   .object({
@@ -128,7 +140,7 @@ export const ReplayControlDialSettings = z
     // stored the map parse, and the transform fills it either way.
     speedStops: z.unknown().default({}).transform(parseSpeedStops),
     pressAction: dialGestureField("play-pause"),
-    longPressAction: dialGestureField("set-1x-play"),
+    longPressAction: dialGestureField("mode-default"),
     tapAction: dialGestureField("none"),
     longTouchAction: dialGestureField("none"),
     ...dialAppearanceFields,

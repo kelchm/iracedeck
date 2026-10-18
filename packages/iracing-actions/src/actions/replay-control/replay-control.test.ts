@@ -1605,6 +1605,95 @@ describe("ReplayControl", () => {
       vi.mocked(getCommands).mockReset();
     });
 
+    describe("what the host hands the stepping modes (#801)", () => {
+      it.each(["jump-to-fastest-lap walk", "jump-to-race-start walk"])(
+        "a Track Order turn cancels the %s, whose searches ride on the camera's car",
+        (owner) => {
+          const claim = claimReplayCursor(owner);
+
+          host().cancelCameraWalks("dial-track-order");
+
+          expect(claim.cancelledBy).toBe("dial-track-order");
+        },
+      );
+
+      it.each(["dial-lap", "replay-markers next", "jump-to-fastest-lap record jump", "jump-to-race-start jump"])(
+        "a Track Order turn leaves %s standing",
+        (owner) => {
+          const claim = claimReplayCursor(owner);
+
+          host().cancelCameraWalks("dial-track-order");
+
+          expect(claim.cancelledBy).toBeNull();
+        },
+      );
+
+      it.each(["jump-to-fastest-lap walk", "dial-lap"])(
+        "Jump to My Car switches the camera to the player's car and takes no cursor: %s is left standing",
+        async (owner) => {
+          const { getCommands } = await import("@iracedeck/deck-iracing");
+          const camera = { switchNum: vi.fn(() => true) };
+
+          vi.mocked(getCommands).mockReturnValue({ replay: mockReplay, camera } as never);
+          // Read once by the check and once by the switch.
+          vi.mocked(getCarNumberRawFromSessionInfo).mockReturnValueOnce(42).mockReturnValueOnce(42);
+          action["sdkController"].getSessionInfo = vi.fn(() => ({ DriverInfo: { DriverCarIdx: 3 } }) as never);
+          // A walk is the dial gesture's to cancel (`cancelCameraWalks`); a paced search's run is never.
+          const claim = claimReplayCursor(owner);
+
+          expect(host().canJumpToMyCar()).toBe(true);
+          host().jumpToMyCar();
+
+          expect(camera.switchNum).toHaveBeenCalledExactlyOnceWith(42, 0, 0);
+          expect(claim.cancelledBy).toBeNull();
+        },
+      );
+
+      it("Jump to My Car has nothing to switch to with no player's car, or no number for it", () => {
+        action["sdkController"].getSessionInfo = vi.fn(() => ({ DriverInfo: { DriverCarIdx: -1 } }) as never);
+        expect(host().canJumpToMyCar()).toBe(false);
+
+        action["sdkController"].getSessionInfo = vi.fn(() => ({ DriverInfo: { DriverCarIdx: 3 } }) as never);
+        vi.mocked(getCarNumberRawFromSessionInfo).mockReturnValueOnce(null);
+        expect(host().canJumpToMyCar()).toBe(false);
+
+        action["sdkController"].getSessionInfo = vi.fn(() => null as never);
+        expect(host().canJumpToMyCar()).toBe(false);
+      });
+
+      it("reads the record through the keypad's own source: a lap step lands a second before the line", async () => {
+        const { getReplaySessionStore, isReplaySessionStoreInitialized } = await import("@iracedeck/replay-store");
+        const store = { laps: {}, sessions: {} };
+
+        vi.mocked(isReplaySessionStoreInitialized).mockReturnValueOnce(true);
+        vi.mocked(getReplaySessionStore).mockReturnValueOnce(store as never);
+        vi.mocked(getCarNumberRawFromSessionInfo).mockReturnValueOnce(104);
+        action["sdkController"].getSessionInfo = vi.fn(
+          () =>
+            ({
+              WeekendInfo: { SubSessionID: 77 },
+              SessionInfo: { Sessions: [{ SessionNum: 0 }, { SessionNum: 2 }] },
+            }) as never,
+        );
+
+        const source = host().recordSource({ CamCarIdx: 4 } as TelemetryData);
+
+        expect(source.store).toBe(store);
+        expect(source.scope).toEqual({ subSessionId: 77 });
+        expect(source.camCarIdx).toBe(4);
+        expect(source.carNumberRaw(4)).toBe(104);
+        expect(source.lapApproachFrames).toBe(60);
+        expect(source.lastSessionNum).toBe(2);
+        expect(host().recordSource(null).camCarIdx).toBeUndefined();
+      });
+
+      it("reads the binding state without setting the action's active binding", () => {
+        host().isBindingMissing(["replayControlNextCar", "replayControlPrevCar"]);
+
+        expect(action["setActiveBinding"]).not.toHaveBeenCalled();
+      });
+    });
+
     describe("lifecycle", () => {
       it("a dial appearing goes to the surface with its dial settings, never onto the key path", async () => {
         const ev = dialEvent();
@@ -5053,7 +5142,7 @@ describe("ReplayControl", () => {
         });
 
         it("warns when the target car has no resolvable car number", async () => {
-          vi.mocked(getCarNumberRawFromSessionInfo).mockReturnValue(null);
+          vi.mocked(getCarNumberRawFromSessionInfo).mockReturnValueOnce(null);
           action["sdkController"].getCurrentTelemetry = vi.fn(() => telemetryWithBest(2, 5, 3) as any);
 
           await action.onWillAppear(fakeEvent("ctx-1", { mode: "jump-to-fastest-lap" }) as any);

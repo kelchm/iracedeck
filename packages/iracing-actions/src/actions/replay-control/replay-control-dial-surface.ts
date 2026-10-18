@@ -4,11 +4,15 @@
  *
  * Rotating runs the dial's rotation mode (`dial.mode`, one module per mode
  * behind `replay-control-dial-mode.ts`): Speed Control walks the replay speed
- * along a ladder the user shapes, and Frame Jog (#1317) steps the replay one
- * frame per detent. The press gestures are shared by every
- * mode — Play/Pause, Set 1x and play, Reverse direction, Jump to Live — so
- * changing the Mode never changes what a press does. The dial's screen is the
- * shared dash box, drawn from what the mode says it shows.
+ * along a ladder the user shapes, Frame Jog (#1317) steps the replay one
+ * frame per detent, and Lap, Session, Incident and Track Order (#801) step
+ * through the replay record, iRacing's own searches and its Next / Previous
+ * Car binding. The press gestures are shared by every mode — Play/Pause, Set
+ * 1x and play, Reverse direction, Jump to Live, Jump to Race Start, Jump to My
+ * Car — so changing the Mode never changes what a specific pick does; the one
+ * exception is the Mode default, Long Press's default, which runs Jump to My
+ * Car in Track Order and Set 1x and play elsewhere (#801). The dial's screen
+ * is the shared dash box, drawn from what the mode says it shows.
  *
  * Every command is a one-shot pressed through the replay command gate
  * (`shared/replay-command-gate.ts`, #1430), which takes the replay cursor from
@@ -30,10 +34,10 @@ import {
   NOOP_HOLD_PREVIEW,
   svgToDataUri,
 } from "@iracedeck/deck-core";
-import { replaySpeedFromTelemetry, type TelemetryData } from "@iracedeck/iracing-sdk";
+import { replaySpeedFromTelemetry, type ReplayState, type TelemetryData } from "@iracedeck/iracing-sdk";
 import type { ILogger } from "@iracedeck/logger";
 
-import { type DialBoxArgs, renderDialBox, resolveDialBoxColors } from "../../shared/dial-box.js";
+import { type DialBoxArgs, type DialNeighbours, renderDialBox, resolveDialBoxColors } from "../../shared/dial-box.js";
 import { type DialInputEvent, hasDialInputContext } from "../../shared/dial-context.js";
 import { pushDialNameIcon } from "../../shared/dial-name-icon.js";
 import type { DialPendingPreview } from "../../shared/dial-preview.js";
@@ -46,18 +50,47 @@ import {
   readReplayPosition,
   type ReplayGateCommand,
   type ReplayPressResult,
+  waitForReplaySettled,
   waitingReplaySpeed,
 } from "../../shared/replay-command-gate.js";
 import { currentReplayCursorOwner } from "../../shared/replay-cursor.js";
+import { beginReplayJump, describeReplayJump, runReplayJump } from "../../shared/replay-jump-playback.js";
 import { REPLAY_TARGET_GIVE_UP_MS } from "../../shared/replay-position-state.js";
-import type { ReplayDialMode, ReplayDialModeIo, ReplaySpeed } from "./replay-control-dial-mode.js";
+import { resolveReplayWalkStart } from "../../shared/replay-record-walk.js";
+import { isSeeking } from "../../shared/replay-seek.js";
+import { REPLAY_JUMP_MAX_WAIT_MS } from "../../shared/replay-timing.js";
 import type {
-  ReplayControlDialGesture,
-  ReplayControlDialMode,
-  ReplayControlDialSettings,
+  ReplayDialMode,
+  ReplayDialModeIo,
+  ReplayDialModeView,
+  ReplayDialStepIo,
+  ReplaySpeed,
+} from "./replay-control-dial-mode.js";
+import {
+  REPLAY_DIAL_MODES,
+  type ReplayControlDialGesture,
+  type ReplayControlDialMode,
+  type ReplayControlDialSettings,
 } from "./replay-control-dial-settings.js";
 import { frameJogMode } from "./replay-control-frame-jog.js";
+import { incidentMode } from "./replay-control-incident-mode.js";
+import { lapMode } from "./replay-control-lap-mode.js";
+import { sessionMode } from "./replay-control-session-mode.js";
 import { speedMode } from "./replay-control-speed-mode.js";
+import { jumpToMyCarFromDial, trackOrderMode } from "./replay-control-track-order-mode.js";
+import {
+  findRecordStep,
+  type RecordStepResult,
+  type RecordStepSource,
+  type RecordStepSpec,
+} from "./replay-record-step.js";
+import {
+  isReplaySearchRunning,
+  onReplaySearchChange,
+  onReplaySearchSpeedSent,
+  pendingReplaySearch,
+  queueReplaySearch,
+} from "./replay-search-queue.js";
 import { formatPlayCaption, formatSpeedDisplay } from "./replay-speed-format.js";
 import {
   DIAL_SPEED_HOLD_MS,
@@ -93,10 +126,23 @@ const POSITION_FOLLOW_MS = 50;
  * The rotation modes, by `dial.mode`. Rotation, the box's label and its view
  * dispatch through this; a new mode is its module plus one row here.
  */
-export const DIAL_MODES: Record<ReplayControlDialMode, ReplayDialMode> = {
+export const DIAL_MODES: Record<ReplayControlDialMode, ReplayDialMode<ReplayDialStepIo>> = {
   speed: speedMode,
   "frame-jog": frameJogMode,
+  lap: lapMode,
+  session: sessionMode,
+  incident: incidentMode,
+  "track-order": trackOrderMode,
 };
+
+/**
+ * @internal Exported for testing
+ *
+ * Every mode's box label, in `REPLAY_DIAL_MODES` order: each must clear the
+ * side marks on both canvases (`labelClearsSideMarks`, #801), which a test
+ * checks over this list so a new mode cannot be missed.
+ */
+export const REPLAY_DIAL_MODE_LABELS: readonly string[] = REPLAY_DIAL_MODES.map((mode) => DIAL_MODES[mode].label);
 
 /** What the dial surface needs from the owning action. */
 export interface ReplayControlDialHost {
@@ -125,8 +171,42 @@ export interface ReplayControlDialHost {
   jumpToRaceStart(): void;
   /** Whether that press has a race session to aim at; false is the one case a Jump to Race Start key greys for. */
   canJumpToRaceStart(): boolean;
+  /**
+   * The camera switched to the player's car (#801): the keypad's Jump to My
+   * Car switch without the keypad's cursor take. The dial's gesture cancels
+   * only the two walks itself and, during a position jump, waits for it to
+   * land as the Track Order mode's one waiting camera switch
+   * (`jumpToMyCarFromDial`); the keypad's key still takes the cursor from
+   * any owner.
+   */
+  jumpToMyCar(): void;
+  /** Whether that press has a car to switch to: the player's car and its number in the session info. */
+  canJumpToMyCar(): boolean;
   /** Redraws the keypad keys whose icon follows the replay speed. */
   refreshKeys(): void;
+  /**
+   * The controller's debounced replay state at `nowMs` (#1324): where a Lap
+   * or Session turn steps from when no jump of the plugin's is headed
+   * anywhere (`resolveReplayWalkStart`).
+   */
+  replayState(nowMs: number): ReplayState;
+  /** The session info the SDK holds, or null. */
+  sessionInfo(): unknown;
+  /**
+   * What a record lookup reads besides its anchor, with the camera car from
+   * `telemetry`: the keypad's own record-step source (#1426), so a Lap or
+   * Session turn and a key press read the same record the same way.
+   */
+  recordSource(telemetry: TelemetryData | null): RecordStepSource;
+  /** Taps one of the action's key bindings (#801's Track Order mode); resolves to whether it went out. */
+  tapBinding(settingKey: string): Promise<boolean>;
+  /** Whether any of the given global binding keys is unset (#612). Stateless, so a dial may ask it. */
+  isBindingMissing(keys: string | readonly string[]): boolean;
+  /**
+   * Cancels a Jump to Fastest Lap or Jump to Race Start walk that holds the
+   * replay cursor, and no other owner (`cancelReplayCursorOwnerIf`).
+   */
+  cancelCameraWalks(by: string): void;
 }
 
 /** One reading of the replay: the telemetry and the replay speed it carries, decoded once. */
@@ -136,10 +216,15 @@ export interface ReplayDialReading {
   readonly speed: ReplaySpeed | null;
 }
 
-/** What a gesture runs against. */
+/** What a gesture previews against. */
 interface GestureEnv {
   readonly io: ReplayDialModeIo;
   readonly host: ReplayControlDialHost;
+}
+
+/** What a gesture runs against: also the pressed dial's own `io`, for a gesture that waits as a mode's turn does. */
+interface GestureRunEnv extends GestureEnv {
+  readonly dialIo: ReplayDialStepIo;
 }
 
 /** One thing a gesture slot can run. */
@@ -147,7 +232,7 @@ interface DialGesture {
   /** The slot's name in the Stream Deck app's dial hint (the trigger description). */
   readonly label: string;
   /** Runs it. Called only while a replay is on screen. */
-  run(env: GestureEnv): void;
+  run(env: GestureRunEnv): void;
   /**
    * What a release would do right now, for the hold preview (#1120), or null
    * when it would do nothing, which previews nothing rather than a promise.
@@ -157,7 +242,27 @@ interface DialGesture {
   preview(env: GestureEnv): string | null;
 }
 
-type ActiveGesture = Exclude<ReplayControlDialGesture, "none">;
+/** A gesture that runs something itself: not None, and not the Mode default, which resolves to one of these. */
+type ActiveGesture = Exclude<ReplayControlDialGesture, "none" | "mode-default">;
+
+/**
+ * @internal Exported for testing
+ *
+ * What a gesture slot runs in `mode`: its own pick, or for `mode-default`
+ * the mode's (#801, the maintainer's second test round): Jump to My Car in
+ * Track Order, whose turns move the camera from car to car, and Set 1x and
+ * Play in every other mode. Null for None.
+ */
+export function resolveDialGesture(
+  gesture: ReplayControlDialGesture,
+  mode: ReplayControlDialMode,
+): ActiveGesture | null {
+  if (gesture === "none") return null;
+
+  if (gesture !== "mode-default") return gesture;
+
+  return mode === "track-order" ? "jump-to-my-car" : "set-1x-play";
+}
 
 function flipped(speed: ReplaySpeed): ReplaySpeed {
   return { speed: -speed.speed, slowMotion: speed.slowMotion };
@@ -177,8 +282,11 @@ function playCaption(speed: ReplaySpeed): string {
  * `REPLAY_DIAL_GESTURES` and one option in the PI. Every send the surface
  * makes itself takes the replay cursor under a `dial-` owner name; Jump to
  * Live and Jump to Race Start run the keypad's own paths instead, which take
- * it themselves: under the mode's name, `jump-to-live`, and as the replay jump
- * the race-start press starts once its guards have passed.
+ * it themselves: under the mode's name (`jump-to-live`), and as the replay
+ * jump the race-start press starts once its guards have passed. Jump to My
+ * Car is a camera switch and takes no cursor: it cancels only the two walks
+ * and waits behind a position jump, as a Track Order turn does. The Mode
+ * default has no row: it resolves to one ({@link resolveDialGesture}).
  */
 const GESTURES: Record<ActiveGesture, DialGesture> = {
   // A playing replay pauses; a paused one resumes the remembered speed.
@@ -256,12 +364,33 @@ const GESTURES: Record<ActiveGesture, DialGesture> = {
     },
     preview: ({ host }) => (host.canJumpToRaceStart() ? "START" : null),
   },
+  // The player's car on camera (#801): a camera switch, not a replay command,
+  // made as a Track Order turn makes one: only the two walks cancelled, and
+  // behind a position jump it waits for the landing, as the one switch that
+  // waits. With no car of the player's to switch to it sends nothing, so the
+  // hold previews nothing either.
+  "jump-to-my-car": {
+    label: "Jump to My Car",
+    run({ io, dialIo }) {
+      io.logger.info("Dial pressed Jump to My Car");
+      jumpToMyCarFromDial(dialIo).catch((error: unknown) => {
+        io.logger.warn(`Dial Jump to My Car failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    },
+    preview: ({ host }) => (host.canJumpToMyCar() ? "MY CAR" : null),
+  },
 };
 
 /** Per-context runtime state. In memory only. */
 interface ReplayControlDialContext {
   action: IDeckActionContext;
   dial: ReplayControlDialSettings;
+  /**
+   * What this dial's turns and views go through: the surface's shared `io`
+   * and the stepping members, those that carry an origin token bound to this
+   * dial's context id (#801), so a mode never handles the token.
+   */
+  readonly io: ReplayDialStepIo;
   /** Timestamp (ms) the current dial-button press started; 0 when no press is in progress. */
   pressStart: number;
   /** Whether the dial was turned while held during the current press: the release then fires nothing. */
@@ -275,6 +404,19 @@ interface ReplayControlDialContext {
   holdPreview: HoldPreview;
   /** Signature of the last frame pushed; a render whose signature matches pushes nothing. */
   lastRenderSig: string | null;
+  /**
+   * The value, side marks and caption the box last showed in a replay, kept
+   * for a tick whose reading cannot say (a mode's view returns a null value or
+   * caption mid-seek, #801), which leaves them as they were. Null before any,
+   * and after the mode changes.
+   */
+  shownView: {
+    readonly mode: ReplayControlDialMode;
+    readonly value: string;
+    readonly sides: ReplayDialModeView["sides"];
+    readonly caption: string;
+    readonly neighbours: DialNeighbours | null;
+  } | null;
   /**
    * Signature of a built frame waiting in the throttle, or null. While one
    * waits, "would the screen change" is asked against it rather than the frame
@@ -300,8 +442,15 @@ interface BuiltFrame {
  */
 export function buildTriggerDescription(dial: ReplayControlDialSettings): DeckTriggerDescription {
   const description: DeckTriggerDescription = { rotate: DIAL_MODES[dial.mode].rotateDescription };
-  const pushLabel = dial.pressAction === "none" ? undefined : GESTURES[dial.pressAction].label;
-  const holdLabel = dial.longPressAction === "none" ? undefined : GESTURES[dial.longPressAction].label;
+  // The Mode default is labelled as what it runs in this mode; the settings
+  // carry the mode, so a Mode change redraws the hint.
+  const label = (gesture: ReplayControlDialGesture): string | undefined => {
+    const active = resolveDialGesture(gesture, dial.mode);
+
+    return active === null ? undefined : GESTURES[active].label;
+  };
+  const pushLabel = label(dial.pressAction);
+  const holdLabel = label(dial.longPressAction);
 
   if (pushLabel && holdLabel) {
     description.push = `${pushLabel} (hold: ${holdLabel})`;
@@ -311,9 +460,12 @@ export function buildTriggerDescription(dial: ReplayControlDialSettings): DeckTr
     description.push = `Hold: ${holdLabel}`;
   }
 
-  if (dial.tapAction !== "none") description.touch = GESTURES[dial.tapAction].label;
+  const touchLabel = label(dial.tapAction);
+  const longTouchLabel = label(dial.longTouchAction);
 
-  if (dial.longTouchAction !== "none") description.longTouch = GESTURES[dial.longTouchAction].label;
+  if (touchLabel) description.touch = touchLabel;
+
+  if (longTouchLabel) description.longTouch = longTouchLabel;
 
   return description;
 }
@@ -328,9 +480,10 @@ export class ReplayControlDialSurface {
   private readonly renderThrottle = new IconUpdateThrottle();
 
   /**
-   * What a rotation mode and a gesture send through. One for every dial: the
-   * replay speed, its pending overlay and the remembered speed are each one
-   * value (`replay-speed-state.ts`), because iRacing has one replay speed.
+   * What a gesture sends through, and the base of every dial's own `io`
+   * ({@link dialIo}). One for every dial: the replay speed, its pending
+   * overlay and the remembered speed are each one value
+   * (`replay-speed-state.ts`), because iRacing has one replay speed.
    */
   private readonly io: ReplayDialModeIo;
 
@@ -359,6 +512,9 @@ export class ReplayControlDialSurface {
 
   /** The replay frame the last tick carried and whether it read as paused, for {@link tracePausedFrame}; null before one and out of a replay. */
   private lastTick: { readonly frame: number; readonly paused: boolean } | null = null;
+
+  /** The paced search's change subscription while any dial is on screen (#801), or null. */
+  private searchUnsubscribe: (() => void) | null = null;
 
   /** Whether a synchronous entry ({@link withReading}) is running. */
   private inEntry = false;
@@ -459,6 +615,19 @@ export class ReplayControlDialSurface {
     // A speed the gate held and sent on the landing is this plugin's send too:
     // the dials and the keys take it as they would have at the press.
     onReplaySpeedSentFromSlot((sent) => this.noteSpeedSent(sent));
+
+    // So are the speeds the paced search's runner sends (#801): its pause, and
+    // the playback step at the end of a run, mirrored into the keys as a record
+    // jump's pause and landing are, and drawn at once on any dial on screen,
+    // since a paused replay may deliver no tick. For the surface's life, like
+    // the gate's: a run outlives the page its dial was turned on, and the keys
+    // still show its speed after a page flip.
+    onReplaySearchSpeedSent((speed) =>
+      this.withReading(() => {
+        this.noteSpeedSent(speed);
+        this.renderAll();
+      }),
+    );
   }
 
   async willAppear(action: IDeckActionContext, dial: ReplayControlDialSettings): Promise<void> {
@@ -483,6 +652,12 @@ export class ReplayControlDialSurface {
     ctx.holdPreview.dispose();
     this.renderThrottle.clear(actionId);
     this.contexts.delete(actionId);
+
+    if (this.contexts.size === 0) {
+      this.searchUnsubscribe?.();
+      this.searchUnsubscribe = null;
+    }
+
     // The lapse timer is left running: the pending speed it answers for
     // outlives the dial, and a dial that comes back inside the hold (a page
     // flip and back) draws that speed and needs the redraw. With no dial on
@@ -525,9 +700,127 @@ export class ReplayControlDialSurface {
         return;
       }
 
-      DIAL_MODES[ctx.dial.mode].rotate(ticks, ctx.dial, this.io);
+      const turn = DIAL_MODES[ctx.dial.mode].rotate(ticks, ctx.dial, ctx.io);
+
+      if (turn !== undefined) this.followTurn(turn);
+
       this.renderAll();
     });
+  }
+
+  /**
+   * A turn that waits for something (#801): a rejection is logged, never
+   * left unhandled, and every dial is redrawn once it settles, since the
+   * replay it moved may deliver no tick when it lands. A further turn
+   * meanwhile is not dropped here: the mode takes it.
+   */
+  private followTurn(turn: Promise<void>): void {
+    void turn
+      .catch((error: unknown) => {
+        this.host.logger.error(
+          `Replay control dial turn failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => this.withReading(() => this.renderAll()));
+  }
+
+  /**
+   * One waited record jump to `frame` (#801): the shared jump sequence
+   * (#1276), claimed and its frame recorded as the pending target now, as the
+   * dial's own cursor take, so the pending speed it sent stands. Mirrors the
+   * pause and the speed the jump left the replay at into the dials and the
+   * keys, as the keypad's record step does, and logs how it ended.
+   */
+  private async recordJump(owner: string, frame: number, origin: string): Promise<void> {
+    const telemetry = this.reading().telemetry;
+    const jump = keepDialPendingSpeed(() =>
+      beginReplayJump(owner, telemetry, undefined, Date.now(), { frame, origin }),
+    );
+
+    this.armPositionFollow();
+
+    try {
+      const outcome = await runReplayJump(jump, {
+        frame,
+        readTelemetry: () => this.host.telemetry(),
+        onPaused: () => this.noteSpeedSent(PAUSED),
+      });
+
+      if (outcome.kind === "landed") this.noteSpeedSent(outcome.speed);
+
+      const report = describeReplayJump(outcome, frame);
+
+      if (report.warn !== null) this.host.logger.warn(`Replay control dial (${owner}): ${report.warn}`);
+
+      this.host.logger.debug(`Replay control dial (${owner}): ${report.detail}`);
+    } finally {
+      jump.end();
+    }
+  }
+
+  /**
+   * Where a record step of `steps` entries lands (#801), measured from where
+   * the replay is headed while a jump of the plugin's stands, else from the
+   * debounced cursor (`resolveReplayWalkStart`). With no cursor to step from
+   * it is a miss, and the turn goes to the search.
+   */
+  private recordStep(step: RecordStepSpec, steps: number): RecordStepResult {
+    const now = Date.now();
+    const start = resolveReplayWalkStart(this.host.replayState(now), this.reading().telemetry, now);
+
+    if (start.frame === null) return { hit: false, reason: start.reason };
+
+    this.host.logger.debug(`Replay control dial: ${step.label} x${steps} from ${start.from} frame ${start.frame}`);
+
+    return findRecordStep(step, start.frame, this.recordSource(), steps);
+  }
+
+  /** What a record lookup reads: the action's record-step source, with the camera car from the running entry's reading. */
+  private recordSource(): RecordStepSource {
+    return this.host.recordSource(this.reading().telemetry);
+  }
+
+  /**
+   * A dial's own `io` (#801): the shared one and what the stepping modes need
+   * beside it. The members that carry an origin token — the record jump and
+   * the paced search — have this dial's context id `origin` bound, and the
+   * check a waiting camera switch (a Track Order tap, or the Jump to My Car
+   * gesture's switch) makes before it goes out asks `isCurrent` whether
+   * the context it was built for is still the one on screen.
+   */
+  private dialIo(origin: string, isCurrent: () => boolean): ReplayDialStepIo {
+    const host = this.host;
+
+    return {
+      ...this.io,
+      recordJump: (owner, frame) => this.recordJump(owner, frame, origin),
+      recordStep: (step, steps) => this.recordStep(step, steps),
+      recordSource: () => this.recordSource(),
+      sessionInfo: () => host.sessionInfo(),
+      queueSearch: (owner, target, ticks) => queueReplaySearch({ target, ticks, origin, owner }),
+      isSearchRunning: (target) => isReplaySearchRunning(target),
+      pendingSearch: (target) => {
+        const pending = pendingReplaySearch();
+
+        return pending !== null && pending.target === target ? pending.count : null;
+      },
+      tapBinding: (settingKey) => host.tapBinding(settingKey),
+      isBindingMissing: (keys) => host.isBindingMissing(keys),
+      cancelCameraWalks: (by) => host.cancelCameraWalks(by),
+      jumpToMyCar: () => host.jumpToMyCar(),
+      isJumpUnderWay: () => {
+        const telemetry = this.reading().telemetry;
+
+        // A target standing (settled against this reading first), or a seek showing in a replay.
+        return this.io.position()?.seeking === true || (host.inReplay() && isSeeking(telemetry));
+      },
+      // With no claim: the wait takes no cursor, cancels nothing, and ends only
+      // settled or at the bound, whatever jump starts meanwhile.
+      waitForJumpsToSettle: () =>
+        waitForReplaySettled({ jumpsOnly: true, reads: 3, timeoutMs: REPLAY_JUMP_MAX_WAIT_MS }),
+      isStillOnScreen: () => isCurrent() && this.isReplayOnScreen(),
+      isSavedReplay: () => host.replayState(Date.now()).replayOnlySession,
+    };
   }
 
   down(action: IDeckActionContext, dial: ReplayControlDialSettings): void {
@@ -569,12 +862,15 @@ export class ReplayControlDialSurface {
 
     if (kind === "push-turn") return;
 
-    const gesture = kind === "long" ? ctx.dial.longPressAction : ctx.dial.pressAction;
+    const gesture = resolveDialGesture(
+      kind === "long" ? ctx.dial.longPressAction : ctx.dial.pressAction,
+      ctx.dial.mode,
+    );
 
-    if (gesture === "none") return;
+    if (gesture === null) return;
 
     this.host.logger.info(kind === "long" ? "Replay control dial long-pressed" : "Replay control dial pressed");
-    this.runGesture(gesture, ctx.action.id);
+    this.runGesture(gesture, ctx);
   }
 
   touchTap(action: IDeckActionContext, dial: ReplayControlDialSettings, hold: boolean): void {
@@ -585,12 +881,12 @@ export class ReplayControlDialSurface {
     if (!ctx) return;
 
     // hold → the Long Touch slot; a plain tap → Tap Display.
-    const gesture = hold ? ctx.dial.longTouchAction : ctx.dial.tapAction;
+    const gesture = resolveDialGesture(hold ? ctx.dial.longTouchAction : ctx.dial.tapAction, ctx.dial.mode);
 
-    if (gesture === "none") return;
+    if (gesture === null) return;
 
     this.host.logger.info(hold ? "Replay control dial long touch" : "Replay control dial tap");
-    this.withReading(() => this.runGesture(gesture, ctx.action.id));
+    this.withReading(() => this.runGesture(gesture, ctx));
   }
 
   /**
@@ -723,8 +1019,8 @@ export class ReplayControlDialSurface {
     return currentReplayCursorOwner() !== null || isReplayMoveUnderWay() || this.io.position()?.seeking === true;
   }
 
-  /** Runs a gesture slot's assignment; outside a replay it sends nothing. */
-  private runGesture(gesture: ActiveGesture, origin: string): void {
+  /** Runs a gesture slot's assignment for the dial `ctx`; outside a replay it sends nothing. */
+  private runGesture(gesture: ActiveGesture, ctx: ReplayControlDialContext): void {
     if (!this.isReplayOnScreen()) {
       this.host.logger.debug(`Dial ${gesture}: no replay on screen, and iRacing ignores replay commands from the car`);
 
@@ -732,10 +1028,10 @@ export class ReplayControlDialSurface {
     }
 
     // A gesture's commands carry the dial's own origin token; a detent's carry none.
-    this.pressOrigin = origin;
+    this.pressOrigin = ctx.action.id;
 
     try {
-      GESTURES[gesture].run({ io: this.io, host: this.host });
+      GESTURES[gesture].run({ io: this.io, host: this.host, dialIo: ctx.io });
     } finally {
       this.pressOrigin = undefined;
     }
@@ -819,9 +1115,9 @@ export class ReplayControlDialSurface {
    * than a default (#1120, trap 2).
    */
   private resolvePreview(ctx: ReplayControlDialContext): DialPendingPreview | null {
-    const gesture = ctx.dial.longPressAction;
+    const gesture = resolveDialGesture(ctx.dial.longPressAction, ctx.dial.mode);
 
-    if (gesture === "none" || !this.isReplayOnScreen()) return null;
+    if (gesture === null || !this.isReplayOnScreen()) return null;
 
     const text = GESTURES[gesture].preview({ io: this.io, host: this.host });
 
@@ -888,13 +1184,20 @@ export class ReplayControlDialSurface {
     const created: ReplayControlDialContext = {
       action,
       dial,
+      // The context, not only its id: a dial that left and came back is a new one.
+      io: this.dialIo(action.id, () => this.contexts.get(action.id) === created),
       pressStart: 0,
       rotatedWhilePressed: false,
       preview: null,
       holdPreview: NOOP_HOLD_PREVIEW,
       lastRenderSig: null,
+      shownView: null,
       queuedSig: null,
     };
+
+    // The paced search's count is drawn on the box (#801): redraw on its every
+    // change while any dial is on screen.
+    this.searchUnsubscribe ??= onReplaySearchChange(() => this.withReading(() => this.renderAll()));
     // The real helper only where the extended gestures exist (#1120).
     created.holdPreview = __FEATURE_DIAL_EXTENDED_GESTURES__
       ? createHoldPreview({
@@ -933,16 +1236,29 @@ export class ReplayControlDialSurface {
       };
     }
 
-    const view = mode.view(ctx.dial, this.io);
+    const view = mode.view(ctx.dial, ctx.io);
+    // A tick read mid-seek (#801): the box keeps what this mode last showed,
+    // the value with its side marks and neighbours, and the caption, each
+    // where it cannot say.
+    const shown = ctx.shownView?.mode === ctx.dial.mode ? ctx.shownView : null;
+    const value = view.value ?? shown?.value ?? "";
+    const sides = view.value === null ? (shown?.sides ?? view.sides) : view.sides;
+    const neighbours = view.value === null ? (shown?.neighbours ?? null) : (view.neighbours ?? null);
+    const caption = view.caption ?? shown?.caption ?? "";
+
+    ctx.shownView = { mode: ctx.dial.mode, value, sides, caption, neighbours };
 
     return {
       abbr: mode.label,
-      value: view.value,
+      value,
       colors,
-      sideMarker: view.sides,
-      caption: view.caption,
+      sideMarker: sides,
+      caption,
+      ...(view.reserveCaption === true ? { reserveCaptionLine: true } : {}),
+      ...(neighbours === null ? {} : { neighbours }),
       dimmed: false,
       pending: ctx.preview,
+      ...(view.bindingMissing === true ? { bindingMissing: true } : {}),
     };
   }
 

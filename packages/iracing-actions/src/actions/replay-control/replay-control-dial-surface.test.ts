@@ -1,7 +1,20 @@
-import { ReplayPosMode, replaySpeedFromTelemetry, replaySpeedToSdk, type TelemetryData } from "@iracedeck/iracing-sdk";
+import {
+  getCarNumberRawFromSessionInfo,
+  ReplayPosMode,
+  replaySpeedFromTelemetry,
+  replaySpeedToSdk,
+  type TelemetryData,
+} from "@iracedeck/iracing-sdk";
+import type { ReplaySessionStore } from "@iracedeck/replay-store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { _configureReplayCommandGate, _resetReplayCommandGate } from "../../shared/replay-command-gate.js";
+import { labelClearsSideMarks } from "../../shared/dial-label-fit.js";
+import {
+  _configureReplayCommandGate,
+  _resetReplayCommandGate,
+  getReplayGateRecord,
+  pressReplayCommand,
+} from "../../shared/replay-command-gate.js";
 import {
   _resetReplayCursor,
   cancelReplayCursorOwner,
@@ -9,16 +22,24 @@ import {
   currentReplayCursorOwner,
 } from "../../shared/replay-cursor.js";
 import { _resetReplayPositionState, REPLAY_TARGET_GIVE_UP_MS } from "../../shared/replay-position-state.js";
+import { lastListedSessionNum } from "./green-flag-target.js";
 import type { ReplayDialModeIo, ReplaySpeed } from "./replay-control-dial-mode.js";
 import { REPLAY_DIAL_MODES, ReplayControlDialSettings } from "./replay-control-dial-settings.js";
 import {
   buildTriggerDescription,
   DIAL_MODES,
+  REPLAY_DIAL_MODE_LABELS,
   ReplayControlDialSurface,
   type ReplayDialReading,
+  resolveDialGesture,
 } from "./replay-control-dial-surface.js";
 import { frameJogMode } from "./replay-control-frame-jog.js";
+import { incidentMode } from "./replay-control-incident-mode.js";
+import { lapMode } from "./replay-control-lap-mode.js";
+import { sessionMode } from "./replay-control-session-mode.js";
 import { speedMode } from "./replay-control-speed-mode.js";
+import { _resetTrackOrderTap, trackOrderMode } from "./replay-control-track-order-mode.js";
+import type { RecordStepSource } from "./replay-record-step.js";
 import {
   _resetReplaySpeedState,
   DIAL_SPEED_HOLD_MS,
@@ -26,7 +47,47 @@ import {
   rememberedSpeed,
 } from "./replay-speed-state.js";
 
+/**
+ * The paced search (#801) is another module's, and its runner is not under
+ * test here: the surface's half is what it hands a turn and when it redraws,
+ * so the queue is a recording double whose state a test sets.
+ */
+const queue = vi.hoisted(() => ({
+  turns: [] as Array<{ target: string; ticks: number; origin: string; owner: string }>,
+  pending: null as { target: string; count: number; origin: string } | null,
+  running: null as string | null,
+  listeners: new Set<() => void>(),
+  speedListeners: new Set<(speed: { speed: number; slowMotion: boolean }) => void>(),
+}));
+
+vi.mock("./replay-search-queue.js", () => ({
+  queueReplaySearch: (turn: { target: string; ticks: number; origin: string; owner: string }) => {
+    queue.turns.push(turn);
+  },
+  pendingReplaySearch: () => queue.pending,
+  isReplaySearchRunning: (target: string) => queue.running === target,
+  onReplaySearchChange: (listener: () => void) => {
+    queue.listeners.add(listener);
+
+    return () => {
+      queue.listeners.delete(listener);
+    };
+  },
+  onReplaySearchSpeedSent: (listener: (speed: { speed: number; slowMotion: boolean }) => void) => {
+    queue.speedListeners.add(listener);
+
+    return () => {
+      queue.speedListeners.delete(listener);
+    };
+  },
+  _resetReplaySearchQueue: () => undefined,
+}));
+
+/** The replay record the host's record source reads (#801): null for none initialized. */
+const store = { value: null as unknown };
+
 const mocks = vi.hoisted(() => ({
+  nextLap: vi.fn(() => true),
   setPlaySpeed: vi.fn((_speed: number, _slowMotion?: boolean) => true),
   pause: vi.fn(() => true),
   nextFrame: vi.fn(() => true),
@@ -46,6 +107,7 @@ vi.mock("@iracedeck/deck-iracing", () => ({
       nextFrame: mocks.nextFrame,
       prevFrame: mocks.prevFrame,
       setPlayPosition: mocks.setPlayPosition,
+      nextLap: mocks.nextLap,
     },
   }),
 }));
@@ -100,6 +162,10 @@ const env = {
   inReplay: true,
   /** What a fresh telemetry read returns. */
   telemetry: null as TelemetryData | null,
+  /** What the SDK's session info is. */
+  sessionInfo: null as unknown,
+  /** Whether the loaded session is a saved replay (the controller's sticky `SimMode` answer). */
+  replayOnlySession: false,
 };
 
 /** A tick as the owning action hands it over, carrying `telemetry` (what a fresh read returns, unless given). */
@@ -120,7 +186,31 @@ const host = {
   jumpToLive: vi.fn(() => undefined),
   jumpToRaceStart: vi.fn(() => undefined),
   canJumpToRaceStart: vi.fn(() => true),
+  jumpToMyCar: vi.fn(() => undefined),
+  canJumpToMyCar: vi.fn(() => true),
   refreshKeys: vi.fn(() => undefined),
+  /** The debounced replay state: in a replay, at the frame a fresh read shows, seen just now. */
+  replayState: vi.fn((nowMs: number) => ({
+    inReplay: env.inReplay,
+    frame: env.telemetry?.ReplayFrameNum ?? null,
+    replayOnlySession: env.replayOnlySession,
+    tickReplayPlaying: env.telemetry?.IsReplayPlaying === true,
+    tickFrame: env.telemetry?.ReplayFrameNum ?? null,
+    replaySeenAt: env.inReplay ? nowMs : null,
+  })),
+  sessionInfo: vi.fn((): unknown => env.sessionInfo),
+  /** The action's record-step source, over {@link store} and the session info, with the camera car the surface hands it. */
+  recordSource: vi.fn((telemetry: TelemetryData | null): RecordStepSource => ({
+    store: store.value as ReplaySessionStore | null,
+    scope: undefined,
+    camCarIdx: telemetry?.CamCarIdx,
+    carNumberRaw: (carIdx) => getCarNumberRawFromSessionInfo(env.sessionInfo, carIdx),
+    lapApproachFrames: 60,
+    lastSessionNum: lastListedSessionNum(env.sessionInfo),
+  })),
+  tapBinding: vi.fn((_key: string) => Promise.resolve(true)),
+  isBindingMissing: vi.fn((_keys: string | readonly string[]) => false),
+  cancelCameraWalks: vi.fn((_by: string) => undefined),
 };
 
 function makeSurface(): ReplayControlDialSurface {
@@ -132,7 +222,15 @@ function makeSurface(): ReplayControlDialSurface {
     jumpToLive: host.jumpToLive,
     jumpToRaceStart: host.jumpToRaceStart,
     canJumpToRaceStart: host.canJumpToRaceStart,
+    jumpToMyCar: host.jumpToMyCar,
+    canJumpToMyCar: host.canJumpToMyCar,
     refreshKeys: host.refreshKeys,
+    replayState: host.replayState as never,
+    sessionInfo: host.sessionInfo,
+    recordSource: host.recordSource,
+    tapBinding: host.tapBinding,
+    isBindingMissing: host.isBindingMissing,
+    cancelCameraWalks: host.cancelCameraWalks,
   });
 }
 
@@ -158,11 +256,23 @@ function lastBox(ctx: DialContext): string {
   return ctx.setDialCanvas.mock.calls.at(-1)?.[0] ?? "";
 }
 
-/** The value slot's text: the last `<text>` that is neither the caption nor the label. */
-function shownValue(svg: string): string {
-  const texts = [...svg.matchAll(/<text(?! data-caption)[^>]*>([^<]*)<\/text>/g)].map((m) => m[1]);
+/** Every mode's label, which `shownValue` skips. */
+const MODE_LABELS = new Set(REPLAY_DIAL_MODE_LABELS);
 
-  return texts.filter((t) => t !== "SPEED" && t !== "FRAME").at(-1) ?? "";
+/** The value slot's text: the last `<text>` that is neither the caption, a neighbour nor the label. */
+function shownValue(svg: string): string {
+  const texts = [...svg.matchAll(/<text(?! data-)[^>]*>([^<]*)<\/text>/g)].map((m) => m[1]);
+
+  return texts.filter((t) => !MODE_LABELS.has(t)).at(-1) ?? "";
+}
+
+/** The texts drawn beside the value (#801), or null with none. */
+function shownNeighbours(svg: string): { left: string; right: string } | null {
+  const side = (name: string) => new RegExp(`<text data-neighbour="${name}"[^>]*>([^<]*)</text>`).exec(svg)?.[1] ?? "";
+  const left = side("left");
+  const right = side("right");
+
+  return left === "" && right === "" ? null : { left, right };
 }
 
 function shownCaption(svg: string): string {
@@ -224,6 +334,15 @@ describe("ReplayControlDialSurface", () => {
     _configureReplayCommandGate({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
     env.inReplay = true;
     env.telemetry = replayAt(speed(1));
+    env.sessionInfo = null;
+    env.replayOnlySession = false;
+    queue.turns.length = 0;
+    queue.pending = null;
+    queue.running = null;
+    queue.listeners.clear();
+    queue.speedListeners.clear();
+    host.isBindingMissing.mockReturnValue(false);
+    host.tapBinding.mockResolvedValue(true);
     mocks.thresholdMs.value = 500;
     mocks.setPlaySpeed.mockReturnValue(true);
     mocks.pause.mockReturnValue(true);
@@ -1627,6 +1746,71 @@ describe("ReplayControlDialSurface", () => {
       expect(host.jumpToRaceStart).not.toHaveBeenCalled();
     });
 
+    it("Jump to My Car runs the action's own press and sends nothing itself (#801)", async () => {
+      const { surface, ctx } = await onScreen(speed(1));
+
+      await press(surface, ctx, dial({ pressAction: "jump-to-my-car" }));
+
+      expect(host.jumpToMyCar).toHaveBeenCalledTimes(1);
+      expect(host.jumpToLive).not.toHaveBeenCalled();
+      expect(host.jumpToRaceStart).not.toHaveBeenCalled();
+      expect(mocks.setPlaySpeed).not.toHaveBeenCalled();
+      expect(mocks.pause).not.toHaveBeenCalled();
+    });
+
+    it("Jump to My Car sends nothing from the car, like every other gesture (#801)", async () => {
+      const { surface, ctx } = await onScreen(speed(1));
+
+      env.inReplay = false;
+      await press(surface, ctx, dial({ pressAction: "jump-to-my-car" }));
+
+      expect(host.jumpToMyCar).not.toHaveBeenCalled();
+    });
+
+    describe("the Mode default (#801)", () => {
+      it("is Long Press's default", () => {
+        expect(dial().longPressAction).toBe("mode-default");
+      });
+
+      it.each(REPLAY_DIAL_MODES.filter((mode) => mode !== "track-order"))(
+        "a long press runs Set 1x and Play in %s",
+        async (mode) => {
+          const d = dial({ mode });
+          const { surface, ctx } = await onScreen(speed(-4), d);
+
+          await press(surface, ctx, d, 500);
+
+          expect(mocks.setPlaySpeed.mock.calls).toEqual([[1, false]]);
+          expect(host.jumpToMyCar).not.toHaveBeenCalled();
+        },
+      );
+
+      it("a long press runs Jump to My Car in Track Order", async () => {
+        const d = dial({ mode: "track-order" });
+        const { surface, ctx } = await onScreen(speed(-4), d);
+
+        await press(surface, ctx, d, 500);
+
+        expect(host.jumpToMyCar).toHaveBeenCalledTimes(1);
+        expectNothingSent();
+      });
+
+      it("follows the Mode on any slot it is set on, and a specific pick does not", async () => {
+        const track = dial({ mode: "track-order", pressAction: "mode-default", tapAction: "mode-default" });
+        const { surface, ctx } = await onScreen(speed(2), track);
+
+        await press(surface, ctx, track);
+        surface.touchTap(ctx as never, track, false);
+        expect(host.jumpToMyCar).toHaveBeenCalledTimes(2);
+
+        // A specific pick is the same in every mode.
+        const pick = dial({ mode: "track-order", longPressAction: "set-1x-play" });
+        await press(surface, ctx, pick, 500);
+        expect(mocks.setPlaySpeed.mock.calls).toEqual([[1, false]]);
+        expect(host.jumpToMyCar).toHaveBeenCalledTimes(2);
+      });
+    });
+
     it("Jump to Live runs the action's own jump and sends nothing itself", async () => {
       const { surface, ctx } = await onScreen(speed(1));
 
@@ -1864,17 +2048,31 @@ describe("ReplayControlDialSurface", () => {
       env.telemetry = { ...replayAt(s), ReplaySessionTime: seconds } as TelemetryData;
     }
 
-    it("registers one mode per dial.mode value: Speed Control and Frame Jog", () => {
+    it("registers one mode per dial.mode value: Speed Control, Frame Jog, Lap, Session, Incident and Track Order", () => {
       expect(Object.keys(DIAL_MODES)).toEqual([...REPLAY_DIAL_MODES]);
       expect(DIAL_MODES.speed).toBe(speedMode);
       expect(DIAL_MODES["frame-jog"]).toBe(frameJogMode);
+      expect(DIAL_MODES.lap).toBe(lapMode);
+      expect(DIAL_MODES.session).toBe(sessionMode);
+      expect(DIAL_MODES.incident).toBe(incidentMode);
+      expect(DIAL_MODES["track-order"]).toBe(trackOrderMode);
     });
 
     it("labels are distinct, so the box says which mode the dial is in", () => {
       const labels = REPLAY_DIAL_MODES.map((mode) => DIAL_MODES[mode].label);
 
-      expect(labels).toEqual(["SPEED", "FRAME"]);
+      expect(labels).toEqual(["SPEED", "FRAME", "LAP", "SESSION", "INCIDENT", "TRK ORD"]);
+      expect(REPLAY_DIAL_MODE_LABELS).toEqual(labels);
+      expect(new Set(labels).size).toBe(labels.length);
     });
+
+    it.each(REPLAY_DIAL_MODE_LABELS)(
+      "%s leaves at least INCIDENT's room between itself and the side marks on the strip and the knob",
+      (label) => {
+        expect(labelClearsSideMarks(label, "strip")).toBe(true);
+        expect(labelClearsSideMarks(label, "knob")).toBe(true);
+      },
+    );
 
     it("a Frame Jog dial's turn goes to Frame Jog, never to the speed ladder", async () => {
       const d = dial({ mode: "frame-jog" });
@@ -1887,8 +2085,9 @@ describe("ReplayControlDialSurface", () => {
       env.telemetry = { ...replayAt(PAUSED), ReplayFrameNum: 5_001 } as TelemetryData;
       surface.rotate(ctx as never, d, -1, false);
 
-      expect(jog).toHaveBeenNthCalledWith(1, 1, d, surface["io"]);
-      expect(jog).toHaveBeenNthCalledWith(2, -1, d, surface["io"]);
+      // The dial's own io: the shared one, with its origin token bound (#801).
+      expect(jog).toHaveBeenNthCalledWith(1, 1, d, surface["contexts"].get(ctx.id)?.io);
+      expect(jog).toHaveBeenNthCalledWith(2, -1, d, surface["contexts"].get(ctx.id)?.io);
       expect(ladder).not.toHaveBeenCalled();
       expect(mocks.nextFrame).toHaveBeenCalledTimes(1);
       expect(mocks.prevFrame).toHaveBeenCalledTimes(1);
@@ -2121,9 +2320,12 @@ describe("ReplayControlDialSurface", () => {
       ["Reverse while paused", "reverse", PAUSED, speed(2), "◄ 2x"],
       ["Jump to Live", "jump-to-live", speed(1), null, "LIVE"],
       ["Jump to Race Start", "jump-to-race-start", speed(1), null, "START"],
+      ["Jump to My Car", "jump-to-my-car", speed(1), null, "MY CAR"],
+      ["the Mode default outside Track Order, as Set 1x and play", "mode-default", speed(-4), null, "► 1x"],
     ])("previews %s", async (_name, longPressAction, live, remembered, expected) => {
       if (remembered) noteTelemetrySpeed(remembered, Date.now());
 
+      host.canJumpToMyCar.mockReturnValue(true);
       const d = dial({ longPressAction });
       const { surface, ctx } = await onScreen(live, d);
 
@@ -2134,6 +2336,18 @@ describe("ReplayControlDialSurface", () => {
       expect(lastBox(ctx)).toContain("data-pending-bar");
     });
 
+    it("previews the Mode default in Track Order as Jump to My Car", async () => {
+      host.canJumpToMyCar.mockReturnValue(true);
+      const d = dial({ mode: "track-order" });
+      const { surface, ctx } = await onScreen(speed(1), d);
+
+      surface.down(ctx as never, d);
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(shownValue(lastBox(ctx))).toBe("MY CAR");
+      expect(lastBox(ctx)).toContain("data-pending-bar");
+    });
+
     it.each<[string, () => void, Record<string, unknown>]>([
       ["a long press set to None", () => undefined, { longPressAction: "none" }],
       ["a dial out of a replay", () => (env.inReplay = false), {}],
@@ -2141,6 +2355,16 @@ describe("ReplayControlDialSurface", () => {
         "Jump to Race Start in a replay with no race session",
         () => host.canJumpToRaceStart.mockReturnValue(false),
         { longPressAction: "jump-to-race-start" },
+      ],
+      [
+        "Jump to My Car with no car of the player's to switch to",
+        () => host.canJumpToMyCar.mockReturnValue(false),
+        { longPressAction: "jump-to-my-car" },
+      ],
+      [
+        "the Mode default in Track Order with no car of the player's",
+        () => host.canJumpToMyCar.mockReturnValue(false),
+        { mode: "track-order" },
       ],
       ["absent telemetry", () => (env.telemetry = null), {}],
     ])("leaves the screen still for %s", async (_name, arrange, overrides) => {
@@ -2655,6 +2879,689 @@ describe("ReplayControlDialSurface", () => {
     });
   });
 
+  describe("Lap, Session, Incident and Track Order (#801)", () => {
+    /** Car 4 (number 12, raw 104) in a three-session event. */
+    const SESSION_INFO = {
+      SessionInfo: {
+        Sessions: [
+          { SessionNum: 0, SessionType: "Practice" },
+          { SessionNum: 1, SessionType: "Qualify" },
+          { SessionNum: 2, SessionType: "Race" },
+        ],
+      },
+      DriverInfo: { Drivers: [{ CarIdx: 4, CarNumber: "12", CarNumberRaw: 104 }] },
+    };
+
+    /** Car 4's laps 1-8, the line crossed every 3000 frames from 50 000; a lap jump lands 60 frames before it. */
+    const LAP_STARTS = [50_000, 53_000, 56_000, 59_000, 62_000, 65_000, 68_000, 71_000].map((frame, i) => ({
+      frame,
+      lap: i + 1,
+      sessionNum: 2,
+      sessionUniqueId: 3,
+    }));
+
+    const SESSION_STARTS = [0, 20_000, 40_000].map((frame, i) => ({ sessionNum: i, sessionUniqueId: 3, frame }));
+
+    /** A paused replay tick at `frame`, the camera on car 4, in session 2. */
+    function pausedOn(frame: number, extra: Partial<TelemetryData> = {}): TelemetryData {
+      return {
+        ...replayAt(PAUSED),
+        ReplayFrameNum: frame,
+        ReplaySessionTime: frame / 60,
+        ReplaySessionNum: 2,
+        CamCarIdx: 4,
+        ...extra,
+      } as TelemetryData;
+    }
+
+    /** What iRacing reports while a jump is under way. */
+    const SEEKING = { ...replayAt(PAUSED), IsReplayPlaying: false, ReplayFrameNum: 0, CamCarIdx: 4 } as TelemetryData;
+
+    function withRecord(laps = LAP_STARTS, sessions = SESSION_STARTS): void {
+      store.value = {
+        laps: { listLapStarts: () => ({ hit: true, starts: laps }) },
+        sessions: { list: () => ({ hit: true, starts: sessions }) },
+      };
+    }
+
+    async function dialIn(mode: string, telemetry: TelemetryData, ctx = dialContext()) {
+      env.telemetry = telemetry;
+      env.sessionInfo = SESSION_INFO;
+      const d = dial({ mode });
+      const surface = makeSurface();
+      await appear(surface, ctx, d);
+
+      return { surface, ctx, d };
+    }
+
+    const seeks = () => mocks.setPlayPosition.mock.calls.map((call) => call[1]);
+
+    beforeEach(() => {
+      store.value = null;
+      _resetTrackOrderTap();
+    });
+
+    describe("Lap and Session: one waited jump per turn", () => {
+      it.each<[number, number]>([
+        [1, 56_000 - 60],
+        [5, 68_000 - 60],
+      ])("a turn of %i detents sends one jump, to the entry the walk reaches", async (ticks, landing) => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, ticks, false);
+
+        expect(seeks()).toEqual([landing]);
+        expect(mocks.pause).not.toHaveBeenCalled();
+        expect(mocks.setPlaySpeed).not.toHaveBeenCalled();
+        expect(queue.turns).toEqual([]);
+      });
+
+      it("a Session turn jumps to the recorded session's landing", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("session", pausedOn(25_000, { ReplaySessionNum: 1 }));
+
+        surface.rotate(ctx as never, d, 1, false);
+
+        expect(seeks()).toEqual([40_000 + 120]);
+      });
+
+      it("a turn during a jump steps from where it is headed, on a mid-seek tick a second later", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 1, false);
+        env.telemetry = SEEKING;
+        await vi.advanceTimersByTimeAsync(1_100);
+        surface.rotate(ctx as never, d, 2, false);
+
+        expect(seeks()).toEqual([56_000 - 60, 62_000 - 60]);
+        expect(mocks.pause).not.toHaveBeenCalled();
+      });
+
+      it("on a playing replay the first jump pauses; a second turn before the pause shows seeks at once, with no second pause", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", {
+          ...replayAt(speed(1)),
+          ReplayFrameNum: 54_000,
+          CamCarIdx: 4,
+        } as TelemetryData);
+
+        surface.rotate(ctx as never, d, 1, false);
+        expect(mocks.setPlaySpeed.mock.calls).toEqual([[0]]);
+        expect(seeks()).toEqual([]);
+
+        surface.rotate(ctx as never, d, 1, false);
+        expect(seeks()).toEqual([59_000 - 60]);
+
+        // The pause shows: nothing more goes out for it.
+        env.telemetry = pausedOn(54_010);
+        await vi.advanceTimersByTimeAsync(200);
+        expect(mocks.setPlaySpeed.mock.calls).toEqual([[0]]);
+        expect(seeks()).toEqual([59_000 - 60]);
+      });
+
+      it("a record that runs out part-way jumps as far as it reaches and drops the rest", async () => {
+        withRecord(LAP_STARTS.slice(0, 5));
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 6, false);
+
+        expect(seeks()).toEqual([62_000 - 60]);
+        expect(queue.turns).toEqual([]);
+      });
+
+      it.each(["lap", "session"])("a %s turn the record has no step for goes to the search whole", async (mode) => {
+        const { surface, ctx, d } = await dialIn(mode, pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, -3, false);
+
+        expect(seeks()).toEqual([]);
+        expect(queue.turns).toEqual([{ target: mode, ticks: -3, origin: ctx.id, owner: `dial-${mode}` }]);
+      });
+
+      it("a Lap turn while the search works for laps goes to its count, not to the record", async () => {
+        withRecord();
+        queue.running = "lap";
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 2, false);
+
+        expect(seeks()).toEqual([]);
+        expect(queue.turns).toEqual([{ target: "lap", ticks: 2, origin: ctx.id, owner: "dial-lap" }]);
+      });
+
+      it.each(["lap", "session", "incident", "track-order"])("a %s turn from the car sends nothing", async (mode) => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn(mode, pausedOn(54_000));
+        env.inReplay = false;
+
+        surface.rotate(ctx as never, d, 1, false);
+        await settle();
+
+        expect(seeks()).toEqual([]);
+        expect(queue.turns).toEqual([]);
+        expect(host.tapBinding).not.toHaveBeenCalled();
+      });
+
+      it("a record jump's landing is mirrored to the keys and the box redrawn when the turn settles", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 1, false);
+        env.telemetry = pausedOn(56_000 - 60);
+        await vi.advanceTimersByTimeAsync(300);
+
+        expect(currentReplayCursorOwner()).toBeNull();
+        expect(logger.error).not.toHaveBeenCalled();
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
+        expect(shownValue(lastBox(ctx))).toBe("3/8");
+      });
+    });
+
+    describe("Incident", () => {
+      it("every turn goes to the search", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("incident", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 1, false);
+        surface.rotate(ctx as never, d, -2, false);
+
+        expect(queue.turns.map((turn) => [turn.target, turn.ticks, turn.owner])).toEqual([
+          ["incident", 1, "dial-incident"],
+          ["incident", -2, "dial-incident"],
+        ]);
+        expect(seeks()).toEqual([]);
+      });
+    });
+
+    describe("the origin token (#1437)", () => {
+      it("a Lap and a Session turn's record jump carries the turned dial's token", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000), dialContext("lap-dial"));
+
+        surface.rotate(ctx as never, d, 1, false);
+        expect(getReplayGateRecord().jump).toEqual({ owner: "dial-lap", origin: "lap-dial" });
+
+        const other = dialContext("session-dial");
+        const session = dial({ mode: "session" });
+        await appear(surface, other, session);
+        surface.rotate(other as never, session, -1, false);
+        expect(getReplayGateRecord().jump).toEqual({ owner: "dial-session", origin: "session-dial" });
+      });
+
+      it("each dial's search turn carries its own token", async () => {
+        const surface = makeSurface();
+        const a = dialContext("a");
+        const b = dialContext("b");
+        const d = dial({ mode: "incident" });
+        env.telemetry = pausedOn(54_000);
+        await appear(surface, a, d);
+        await appear(surface, b, d);
+
+        surface.rotate(a as never, d, 1, false);
+        surface.rotate(b as never, d, 1, false);
+
+        expect(queue.turns.map((turn) => turn.origin)).toEqual(["a", "b"]);
+      });
+
+      it("a Track Order turn carries none: it sends no replay command and claims nothing", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 1, false);
+        await settle();
+
+        expect(getReplayGateRecord().jump).toBeNull();
+        expect(currentReplayCursorOwner()).toBeNull();
+        expect(queue.turns).toEqual([]);
+      });
+    });
+
+    describe("Car", () => {
+      it("taps at once on a quiet replay, one tap per event, the right binding each way", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(54_000));
+
+        surface.rotate(ctx as never, d, 3, false);
+        surface.rotate(ctx as never, d, -1, false);
+        await settle();
+
+        expect(host.tapBinding.mock.calls).toEqual([["replayControlNextCar"], ["replayControlPrevCar"]]);
+        expect(host.cancelCameraWalks).toHaveBeenCalledWith("dial-track-order");
+      });
+
+      it("taps at once behind a search: a search does not swallow a camera change", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(54_000));
+
+        // A key's search on its way: no target, and no seek showing.
+        pressReplayCommand({ kind: "search", search: "nextLap" }, { by: "next-lap", origin: "key" });
+        expect(mocks.nextLap).toHaveBeenCalledOnce();
+
+        surface.rotate(ctx as never, d, 1, false);
+        await settle(0);
+
+        expect(host.tapBinding).toHaveBeenCalledExactlyOnceWith("replayControlNextCar");
+      });
+
+      it("a turn during a jump waits until no jump has shown for three reads, then taps once", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(600));
+
+        // A jump of the plugin's under way: a target standing, the replay seeking.
+        surface["io"].jumpTo("dial-frame-jog", 9_000);
+        env.telemetry = SEEKING;
+        surface.rotate(ctx as never, d, 1, false);
+        surface.rotate(ctx as never, d, -1, false);
+        await vi.advanceTimersByTimeAsync(3_500);
+        expect(host.tapBinding).not.toHaveBeenCalled();
+
+        env.telemetry = pausedOn(9_000);
+        await vi.advanceTimersByTimeAsync(400);
+
+        expect(host.tapBinding).toHaveBeenCalledExactlyOnceWith("replayControlPrevCar");
+      });
+
+      it("a tap still waiting when the dial disappears is dropped", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(600));
+
+        surface["io"].jumpTo("dial-frame-jog", 9_000);
+        env.telemetry = SEEKING;
+        surface.rotate(ctx as never, d, 1, false);
+        surface.willDisappear(ctx.id);
+
+        env.telemetry = pausedOn(9_000);
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        expect(host.tapBinding).not.toHaveBeenCalled();
+      });
+
+      it("a Long Press cancels only the two walks: another dial's paced search run is left standing", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(600));
+        // The runner of another dial's paced search, holding the cursor.
+        const run = claimReplayCursor("dial-lap");
+
+        await press(surface, ctx, d, 500);
+        await settle(0);
+
+        expect(host.cancelCameraWalks).toHaveBeenCalledWith("dial-jump-to-my-car");
+        expect(host.jumpToMyCar).toHaveBeenCalledOnce();
+        expect(run.cancelledBy).toBeNull();
+        expect(currentReplayCursorOwner()).toBe("dial-lap");
+        run.release();
+      });
+
+      it("a Long Press during a position jump switches to my car once the jump has landed", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(600));
+
+        surface["io"].jumpTo("dial-frame-jog", 9_000);
+        env.telemetry = SEEKING;
+        await press(surface, ctx, d, 500);
+        await vi.advanceTimersByTimeAsync(3_500);
+        expect(host.jumpToMyCar).not.toHaveBeenCalled();
+
+        env.telemetry = pausedOn(9_000);
+        await vi.advanceTimersByTimeAsync(400);
+
+        expect(host.jumpToMyCar).toHaveBeenCalledOnce();
+        expect(host.tapBinding).not.toHaveBeenCalled();
+      });
+
+      it("a turn and a Long Press during one jump are one waiting switch: the later one goes out", async () => {
+        const { surface, ctx, d } = await dialIn("track-order", pausedOn(600));
+
+        surface["io"].jumpTo("dial-frame-jog", 9_000);
+        env.telemetry = SEEKING;
+        surface.rotate(ctx as never, d, 1, false);
+        await press(surface, ctx, d, 500);
+        env.telemetry = pausedOn(9_000);
+        await vi.advanceTimersByTimeAsync(400);
+
+        expect(host.jumpToMyCar).toHaveBeenCalledOnce();
+        expect(host.tapBinding).not.toHaveBeenCalled();
+      });
+
+      it("draws the missing-binding warning on the box", async () => {
+        host.isBindingMissing.mockReturnValue(true);
+        const { ctx } = await dialIn("track-order", pausedOn(600));
+
+        expect(lastBox(ctx)).toContain("<binding-warning/>");
+        expect(shownValue(lastBox(ctx))).toBe("#12");
+      });
+    });
+
+    describe("late input", () => {
+      it.each(["lap", "incident"])("a %s turn after willDisappear sends nothing and starts no search", async (mode) => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn(mode, pausedOn(54_000));
+
+        surface.willDisappear(ctx.id);
+        surface.rotate(ctx as never, d, 1, false);
+        await settle();
+
+        expect(seeks()).toEqual([]);
+        expect(queue.turns).toEqual([]);
+      });
+    });
+
+    describe("the display", () => {
+      it("Lap shows the viewed car's lap from the record over the laps the record holds, and the replay time beneath", async () => {
+        withRecord();
+        const { ctx } = await dialIn("lap", pausedOn(57_000));
+
+        // The session info schedules no laps: the record's eight for car 4 in the race.
+        expect(shownValue(lastBox(ctx))).toBe("3/8");
+        expect(shownCaption(lastBox(ctx))).toBe("15:50");
+
+        // Without the record the lap on screen is not known, and nothing counts the laps.
+        store.value = null;
+        const other = dialContext("no-record");
+        await dialIn("lap", pausedOn(5_010), other);
+        expect(shownValue(lastBox(other))).toBe("--");
+        expect(shownCaption(lastBox(other))).toBe("1:23");
+      });
+
+      it("Lap counts a session's scheduled laps over the record's", async () => {
+        withRecord();
+        const { surface, ctx } = await dialIn("lap", pausedOn(57_000));
+        expect(shownValue(lastBox(ctx))).toBe("3/8");
+
+        env.sessionInfo = {
+          ...SESSION_INFO,
+          SessionInfo: { Sessions: [{ SessionNum: 2, SessionType: "Race", SessionLaps: 25 }] },
+        };
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+
+        expect(shownValue(lastBox(ctx))).toBe("3/25");
+      });
+
+      it("Session shows the session's type, upper-cased, and the viewed car's lap of the session beneath", async () => {
+        withRecord();
+        const { ctx } = await dialIn("session", pausedOn(57_000));
+
+        expect(shownValue(lastBox(ctx))).toBe("RACE");
+        expect(shownCaption(lastBox(ctx))).toBe("3/8");
+
+        const qualifying = dialContext("qualifying");
+        await dialIn("session", pausedOn(30_000, { ReplaySessionNum: 1 }), qualifying);
+        expect(shownValue(lastBox(qualifying))).toBe("QUALIFY");
+        // No lap of car 4's recorded in qualifying, and nothing to count its laps.
+        expect(shownCaption(lastBox(qualifying))).toBe("--");
+      });
+
+      it("Incident shows the replay time with no caption, Track Order the viewed car's number alone", async () => {
+        const { ctx } = await dialIn("incident", pausedOn(3_600 * 60 + 5 * 60));
+        const car = dialContext("track-order");
+        await dialIn("track-order", pausedOn(600), car);
+
+        expect(shownValue(lastBox(ctx))).toBe("60:05");
+        expect(lastBox(ctx)).not.toContain("data-caption");
+        expect(shownValue(lastBox(car))).toBe("#12");
+        expect(lastBox(car)).not.toContain("data-caption");
+        expect(shownNeighbours(lastBox(car))).toBeNull();
+        expect(sides(lastBox(car))).toEqual({ left: true, right: true });
+      });
+
+      it("the stepping modes keep the caption line, so their value has the size and place it has with a caption", async () => {
+        const valueText = (svg: string) => /<text x="[^"]+" y="\d+"[^>]*>60:05<\/text>/.exec(svg)?.[0];
+        const { ctx } = await dialIn("incident", pausedOn(3_600 * 60 + 5 * 60));
+        const idle = valueText(lastBox(ctx));
+
+        queue.pending = { target: "incident", count: 3, origin: ctx.id };
+
+        for (const listener of queue.listeners) listener();
+
+        await settle();
+        expect(shownCaption(lastBox(ctx))).toBe("+3");
+        expect(idle).toBeDefined();
+        expect(valueText(lastBox(ctx))).toBe(idle);
+      });
+
+      it("Track Order flanks the car with its neighbours on track in a saved replay, and not scrubbed back in a live session's", async () => {
+        const field = {
+          DriverInfo: {
+            Drivers: [
+              { CarIdx: 2, CarNumber: "5", CarNumberRaw: 5 },
+              { CarIdx: 4, CarNumber: "12", CarNumberRaw: 104 },
+              { CarIdx: 7, CarNumber: "42", CarNumberRaw: 42 },
+            ],
+          },
+        };
+        const onTrack = pausedOn(600, {
+          CarIdxLapDistPct: [-1, -1, 0.1, -1, 0.5, -1, -1, 0.95],
+          CarIdxTrackSurface: [-1, -1, 3, -1, 3, -1, -1, 3],
+          ReplayFrameNumEnd: 90_000,
+        });
+        const { surface, ctx } = await dialIn("track-order", onTrack);
+
+        env.sessionInfo = field;
+        env.replayOnlySession = true;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(shownValue(lastBox(ctx))).toBe("#12");
+        expect(shownNeighbours(lastBox(ctx))).toEqual({ left: "#5", right: "#42" });
+        expect(lastBox(ctx)).not.toContain("data-caption");
+
+        // A tick read mid-seek keeps the car and its neighbours, as it keeps a value.
+        env.telemetry = SEEKING;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(shownValue(lastBox(ctx))).toBe("#12");
+        expect(shownNeighbours(lastBox(ctx))).toEqual({ left: "#5", right: "#42" });
+
+        env.telemetry = onTrack;
+        env.replayOnlySession = false;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(shownValue(lastBox(ctx))).toBe("#12");
+        expect(shownNeighbours(lastBox(ctx))).toBeNull();
+      });
+
+      it("the caption shows the search's count for the mode's target, redrawn on every change it reports", async () => {
+        const { ctx } = await dialIn("incident", pausedOn(54_000));
+        expect(queue.listeners.size).toBe(1);
+
+        queue.pending = { target: "incident", count: 3, origin: ctx.id };
+
+        for (const listener of queue.listeners) listener();
+
+        await settle();
+        expect(shownCaption(lastBox(ctx))).toBe("+3");
+
+        queue.pending = { target: "incident", count: -2, origin: ctx.id };
+
+        for (const listener of queue.listeners) listener();
+
+        await settle();
+        expect(shownCaption(lastBox(ctx))).toBe("-2");
+
+        // Another target's count is not this dial's.
+        queue.pending = { target: "lap", count: 4, origin: "other" };
+
+        for (const listener of queue.listeners) listener();
+
+        await settle();
+        expect(shownCaption(lastBox(ctx))).toBe("");
+      });
+
+      it("subscribes to the search's count while a dial is on screen and lets go when the last one leaves, but to its speeds for the surface's life", async () => {
+        const surface = makeSurface();
+        expect(queue.listeners.size).toBe(0);
+        expect(queue.speedListeners.size).toBe(1);
+
+        const a = dialContext("a");
+        const b = dialContext("b");
+        await appear(surface, a, dial({ mode: "lap" }));
+        await appear(surface, b, dial({ mode: "incident" }));
+        expect(queue.listeners.size).toBe(1);
+        expect(queue.speedListeners.size).toBe(1);
+
+        surface.willDisappear("a");
+        expect(queue.listeners.size).toBe(1);
+        expect(queue.speedListeners.size).toBe(1);
+        surface.willDisappear("b");
+        expect(queue.listeners.size).toBe(0);
+        expect(queue.speedListeners.size).toBe(1);
+      });
+
+      it("mirrors the runner's pause and playback speed into the keys with no dial on screen, as after a page flip mid-run", async () => {
+        const playing = { ...pausedOn(54_000), ...replayAt({ speed: 1, slowMotion: false }) } as TelemetryData;
+        const { surface, ctx } = await dialIn("incident", playing);
+
+        // The page flips away while the run the turn started goes on.
+        surface.willDisappear(ctx.id);
+        host.setLocalSpeed.mockClear();
+        host.refreshKeys.mockClear();
+        ctx.setDialCanvas.mockClear();
+
+        for (const listener of queue.speedListeners) listener({ speed: 0, slowMotion: false });
+
+        await settle();
+        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
+        expect(host.refreshKeys).toHaveBeenCalledTimes(1);
+
+        for (const listener of queue.speedListeners) listener({ speed: 2, slowMotion: false });
+
+        await settle();
+        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(2, false);
+        expect(host.refreshKeys).toHaveBeenCalledTimes(2);
+        // Nothing is drawn on a dial that has left.
+        expect(ctx.setDialCanvas).not.toHaveBeenCalled();
+      });
+
+      it("mirrors every speed the search's runner sends into a dial's caption and the keys, as a record jump's", async () => {
+        const playing = { ...pausedOn(54_000), ...replayAt({ speed: 1, slowMotion: false }) } as TelemetryData;
+        // Frame Jog's caption is the play state.
+        const { ctx } = await dialIn("frame-jog", playing);
+        expect(shownCaption(lastBox(ctx))).toBe("1x");
+
+        // The runner paused the replay for its search: no tick follows yet.
+        for (const listener of queue.speedListeners) listener({ speed: 0, slowMotion: false });
+
+        await settle();
+        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
+        expect(host.refreshKeys).toHaveBeenCalled();
+        expect(shownCaption(lastBox(ctx))).toBe("PAUSED");
+
+        // The run ended at zero and its playback step played the replay on at 2x.
+        host.refreshKeys.mockClear();
+
+        for (const listener of queue.speedListeners) listener({ speed: 2, slowMotion: false });
+
+        await settle();
+        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(2, false);
+        expect(host.refreshKeys).toHaveBeenCalled();
+        expect(shownCaption(lastBox(ctx))).toBe("2x");
+      });
+
+      it("Lap and Session side marks: lit with somewhere to go, dim with a record that has nothing that way, lit with no record", async () => {
+        withRecord();
+        const { ctx } = await dialIn("session", pausedOn(41_000, { ReplaySessionNum: 2 }));
+        expect(sides(lastBox(ctx))).toEqual({ left: true, right: false });
+
+        const middle = dialContext("middle");
+        await dialIn("session", pausedOn(30_000, { ReplaySessionNum: 1 }), middle);
+        expect(sides(lastBox(middle))).toEqual({ left: true, right: true });
+
+        store.value = null;
+        const none = dialContext("none");
+        await dialIn("session", pausedOn(41_000), none);
+        expect(sides(lastBox(none))).toEqual({ left: true, right: true });
+      });
+
+      it("a tick read mid-seek leaves the value as it was", async () => {
+        const { surface, ctx } = await dialIn("incident", pausedOn(3_600));
+        expect(shownValue(lastBox(ctx))).toBe("1:00");
+
+        env.telemetry = SEEKING;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+
+        expect(shownValue(lastBox(ctx))).toBe("1:00");
+      });
+
+      it("a tick read mid-seek leaves the caption as it was too", async () => {
+        withRecord();
+        const { surface, ctx } = await dialIn("lap", pausedOn(57_000));
+        expect(shownCaption(lastBox(ctx))).toBe("15:50");
+
+        env.telemetry = SEEKING;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+
+        expect(shownValue(lastBox(ctx))).toBe("3/8");
+        expect(shownCaption(lastBox(ctx))).toBe("15:50");
+      });
+
+      it("during a record jump, Lap and Session show the entry at the pending landing", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
+        expect(shownValue(lastBox(ctx))).toBe("2/8");
+        expect(shownCaption(lastBox(ctx))).toBe("15:00");
+
+        surface.rotate(ctx as never, d, 2, false);
+        env.telemetry = SEEKING;
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(shownValue(lastBox(ctx))).toBe("4/8");
+        // The target's time beneath it, worked out from the reading the jump started from.
+        expect(shownCaption(lastBox(ctx))).toBe("16:22");
+
+        const session = dialContext("session");
+        await dialIn("session", SEEKING, session);
+        // The jump above is headed for 58 940, in session 2 by the record.
+        expect(shownValue(lastBox(session))).toBe("RACE");
+      });
+
+      it("a paused dial pushes once: the signature holds everything shown, and nothing else", async () => {
+        withRecord();
+        const { surface, ctx } = await dialIn("lap", pausedOn(57_000));
+        const pushes = ctx.setDialCanvas.mock.calls.length;
+
+        surface.onTick(ctx.id, tickOf());
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(ctx.setDialCanvas.mock.calls.length).toBe(pushes);
+
+        // The camera on another car changes what is shown.
+        env.telemetry = pausedOn(57_000, { CamCarIdx: 9 });
+        surface.onTick(ctx.id, tickOf());
+        await settle();
+        expect(ctx.setDialCanvas.mock.calls.length).toBe(pushes + 1);
+      });
+    });
+
+    describe("the seam", () => {
+      it("a rejected rotate promise is logged and the dial redrawn", async () => {
+        const { surface, ctx, d } = await dialIn("incident", pausedOn(54_000));
+        const rotate = vi.spyOn(DIAL_MODES.incident, "rotate").mockReturnValue(Promise.reject(new Error("boom")));
+        const pushes = ctx.setDialCanvas.mock.calls.length;
+
+        queue.pending = { target: "incident", count: 2, origin: ctx.id };
+        surface.rotate(ctx as never, d, 1, false);
+        await settle();
+
+        expect(logger.error).toHaveBeenCalledWith("Replay control dial turn failed: boom");
+        expect(ctx.setDialCanvas.mock.calls.length).toBeGreaterThan(pushes);
+        expect(shownCaption(lastBox(ctx))).toBe("+2");
+        rotate.mockRestore();
+      });
+
+      it("a detent after the replay state's grace, while a jump holds the cursor, is still taken; after the surface's hold it is not", async () => {
+        const { surface, ctx, d } = await dialIn("incident", pausedOn(54_000));
+        const claim = claimReplayCursor("dial-lap");
+
+        env.inReplay = false;
+        surface.rotate(ctx as never, d, 1, false);
+        expect(queue.turns).toHaveLength(1);
+
+        await vi.advanceTimersByTimeAsync(REPLAY_TARGET_GIVE_UP_MS + 100);
+        surface.rotate(ctx as never, d, 1, false);
+        expect(queue.turns).toHaveLength(1);
+        claim.release();
+      });
+    });
+  });
+
   describe("trigger descriptions", () => {
     it("describe the mode's rotation and the gestures, the long press as a hold hint", () => {
       expect(buildTriggerDescription(dial())).toEqual({
@@ -2691,6 +3598,21 @@ describe("ReplayControlDialSurface", () => {
       }
     });
 
+    it("name the Mode default by what it runs in the dial's mode (#801)", () => {
+      expect(buildTriggerDescription(dial({ mode: "track-order" }))).toEqual({
+        rotate: "Cycle Cars by Track Order",
+        push: "Play/Pause (hold: Jump to My Car)",
+      });
+      expect(buildTriggerDescription(dial({ mode: "lap", tapAction: "mode-default" }))).toEqual({
+        rotate: "Next / previous lap",
+        push: "Play/Pause (hold: Set 1x and play)",
+        touch: "Set 1x and play",
+      });
+      expect(
+        buildTriggerDescription(dial({ mode: "track-order", pressAction: "jump-to-my-car", longPressAction: "none" })),
+      ).toEqual({ rotate: "Cycle Cars by Track Order", push: "Jump to My Car" });
+    });
+
     it("name Frame Jog's rotation on a Frame Jog dial, with the same gesture hints", () => {
       expect(buildTriggerDescription(dial({ mode: "frame-jog" }))).toEqual({
         rotate: "Next / previous frame",
@@ -2713,5 +3635,20 @@ describe("ReplayControlDialSurface", () => {
       await appear(surface, knob);
       expect(knob.setTriggerDescription).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("resolveDialGesture", () => {
+  it.each(REPLAY_DIAL_MODES)("resolves the Mode default in %s", (mode) => {
+    expect(resolveDialGesture("mode-default", mode)).toBe(mode === "track-order" ? "jump-to-my-car" : "set-1x-play");
+  });
+
+  it("passes a specific pick through in every mode, and None as nothing", () => {
+    for (const mode of REPLAY_DIAL_MODES) {
+      expect(resolveDialGesture("jump-to-my-car", mode)).toBe("jump-to-my-car");
+      expect(resolveDialGesture("set-1x-play", mode)).toBe("set-1x-play");
+      expect(resolveDialGesture("play-pause", mode)).toBe("play-pause");
+      expect(resolveDialGesture("none", mode)).toBeNull();
+    }
   });
 });

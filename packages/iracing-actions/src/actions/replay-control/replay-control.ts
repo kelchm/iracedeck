@@ -86,7 +86,11 @@ import {
   setReplayCommandGateLogger,
   waitForReplayJumpsToSettle,
 } from "../../shared/replay-command-gate.js";
-import { cancelReplayCursorOwner, type ReplayCursorClaim } from "../../shared/replay-cursor.js";
+import {
+  cancelReplayCursorOwner,
+  cancelReplayCursorOwnerIf,
+  type ReplayCursorClaim,
+} from "../../shared/replay-cursor.js";
 import {
   applyReplayJumpPlayback,
   beginReplayJump,
@@ -118,7 +122,8 @@ import { halvingProbeFrames } from "./lap-walk-probes.js";
 import { replayControlDialField } from "./replay-control-dial-settings.js";
 import { ReplayControlDialSurface } from "./replay-control-dial-surface.js";
 import { observeIncidentSearch } from "./replay-incident-observer.js";
-import { findRecordStep, RECORD_STEPS, type RecordStepMode } from "./replay-record-step.js";
+import { findRecordStep, RECORD_STEPS, type RecordStepMode, type RecordStepSource } from "./replay-record-step.js";
+import { setReplaySearchQueueLogger } from "./replay-search-queue.js";
 import { formatSpeedDisplay, parseSpeedSetting } from "./replay-speed-format.js";
 import { noteTelemetrySpeed } from "./replay-speed-state.js";
 
@@ -981,7 +986,25 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     jumpToRaceStart: () => this.executeMode("__dial__", this.parseSettings({ mode: "jump-to-race-start" })),
     canJumpToRaceStart: () =>
       resolveGreenFlagTarget(this.sdkController.getSessionInfo(), this.sdkController.getCurrentTelemetry()) !== null,
+    // The keypad's Jump to My Car switch (#801), without its cursor take: the
+    // dial's gesture cancels only the two walks, and waits behind a position jump.
+    jumpToMyCar: () => this.switchToMyCar(),
+    canJumpToMyCar: () => "carNum" in this.resolveMyCarNumberRaw(),
     refreshKeys: () => this.updateAllTelemetryDisplays(),
+    // What the Lap and Session modes step from and through (#801): the same
+    // reads, and the same record source, as the keypad's record step.
+    replayState: (nowMs) => this.sdkController.getReplayState(nowMs),
+    sessionInfo: () => this.sdkController.getSessionInfo(),
+    recordSource: (telemetry) => this.recordStepSource(telemetry),
+    // The Track Order mode's binding (#801). Never `setActiveBinding`: its readiness
+    // state is one value per action instance, and a dial's would bleed onto the
+    // keys; `isBindingMissing` is stateless.
+    tapBinding: (settingKey) => this.tapBinding(settingKey),
+    isBindingMissing: (keys) => this.isBindingMissing(keys),
+    // Only the two walks whose searches ride on the camera's car stop for a camera switch.
+    cancelCameraWalks: (by) => {
+      cancelReplayCursorOwnerIf([FASTEST_LAP_WALK_OWNER, RACE_START_WALK_OWNER], by);
+    },
   });
 
   /**
@@ -998,6 +1021,8 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     // (#1430), whose own lines (a press held behind a jump, one dropped) go
     // to a scope of this action's log.
     setReplayCommandGateLogger(this.logger.createScope("ReplayGate"));
+    // The dial's paced search (#801) logs to a scope of its own beside it.
+    setReplaySearchQueueLogger(this.logger.createScope("ReplaySearch"));
   }
 
   override async onWillAppear(ev: IDeckWillAppearEvent<ReplayControlSettings>): Promise<void> {
@@ -1276,6 +1301,23 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
   }
 
   /**
+   * The player's car for Jump to My Car: its raw number for the camera
+   * switch, or why there is none. Shared by the press and the dial's hold
+   * preview of it (#801), so the preview promises only what the press does.
+   */
+  private resolveMyCarNumberRaw(): { carNum: number } | { miss: string } {
+    const sessionInfo = this.sdkController.getSessionInfo();
+    const driverInfo = (sessionInfo as Record<string, unknown>)?.DriverInfo as Record<string, unknown> | undefined;
+    const driverCarIdx = (driverInfo?.DriverCarIdx as number) ?? -1;
+
+    if (driverCarIdx < 0) return { miss: "No session info available for jump to my car" };
+
+    const carNum = this.getCarNumberRawByIdx(driverCarIdx);
+
+    return carNum === null ? { miss: "Could not find car number for player" } : { carNum };
+  }
+
+  /**
    * @internal Exposed for testing.
    *
    * Resolves the carIdx whose fastest lap we should jump to. For
@@ -1293,6 +1335,29 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     }
 
     return (telemetry?.CamCarIdx as number) ?? -1;
+  }
+
+  /**
+   * The camera to the player's car: Jump to My Car's switch, which takes no
+   * cursor of its own. The keypad's key has taken it before this runs, as
+   * every camera-only mode does; the dial's gesture cancels only the two walks
+   * (#801). With no player's car, or no number for it, it warns and sends
+   * nothing.
+   */
+  private switchToMyCar(): void {
+    const myCar = this.resolveMyCarNumberRaw();
+
+    if ("miss" in myCar) {
+      this.logger.warn(myCar.miss);
+
+      return;
+    }
+
+    const { carNum } = myCar;
+    const camera = getCommands().camera;
+    const success = camera.switchNum(carNum, 0, 0);
+    this.logger.info("Jump to my car executed");
+    this.logger.debug(`Result: ${success}, carNum: ${carNum}`);
   }
 
   /**
@@ -2999,16 +3064,7 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
     }
 
     const anchor = start.frame;
-    const sessionInfo = this.sdkController.getSessionInfo();
-    const subSessionId = readSubSessionId(sessionInfo);
-    const found = findRecordStep(step, anchor, {
-      store: isReplaySessionStoreInitialized() ? getReplaySessionStore() : null,
-      scope: subSessionId === undefined ? undefined : { subSessionId },
-      camCarIdx: telemetry?.CamCarIdx,
-      carNumberRaw: (carIdx) => this.getCarNumberRawByIdx(carIdx),
-      lapApproachFrames: LAP_START_APPROACH_FRAMES,
-      lastSessionNum: lastListedSessionNum(sessionInfo),
-    });
+    const found = findRecordStep(step, anchor, this.recordStepSource(telemetry));
 
     if (!found.hit) {
       searchOnMiss(found.reason);
@@ -3038,6 +3094,27 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
         jump.end();
       }
     })();
+  }
+
+  /**
+   * What a record step reads (#1426) besides its anchor, with the camera car
+   * from `telemetry`: the store, the SubSessionID scope, the car numbers, the
+   * lap approach and the event's last session, from the session info the SDK
+   * holds now. The one source behind the keypad's Next / Previous Lap and
+   * Session and the dial's Lap and Session modes (#801).
+   */
+  private recordStepSource(telemetry: TelemetryData | null): RecordStepSource {
+    const sessionInfo = this.sdkController.getSessionInfo();
+    const subSessionId = readSubSessionId(sessionInfo);
+
+    return {
+      store: isReplaySessionStoreInitialized() ? getReplaySessionStore() : null,
+      scope: subSessionId === undefined ? undefined : { subSessionId },
+      camCarIdx: telemetry?.CamCarIdx,
+      carNumberRaw: (carIdx) => this.getCarNumberRawByIdx(carIdx),
+      lapApproachFrames: LAP_START_APPROACH_FRAMES,
+      lastSessionNum: lastListedSessionNum(sessionInfo),
+    };
   }
 
   private executeMode(contextId: string, settings: ReplayControlSettings, repeat = false): void {
@@ -3321,26 +3398,7 @@ export class ReplayControl extends SimIRacingAction<ReplayControlSettings> {
         break;
       }
       case "jump-to-my-car": {
-        const sessionInfo = this.sdkController.getSessionInfo();
-        const driverInfo = (sessionInfo as Record<string, unknown>)?.DriverInfo as Record<string, unknown> | undefined;
-        const driverCarIdx = (driverInfo?.DriverCarIdx as number) ?? -1;
-
-        if (driverCarIdx < 0) {
-          this.logger.warn("No session info available for jump to my car");
-          break;
-        }
-
-        const carNum = this.getCarNumberRawByIdx(driverCarIdx);
-
-        if (carNum === null) {
-          this.logger.warn("Could not find car number for player");
-          break;
-        }
-
-        const camera = getCommands().camera;
-        const success = camera.switchNum(carNum, 0, 0);
-        this.logger.info("Jump to my car executed");
-        this.logger.debug(`Result: ${success}, carNum: ${carNum}`);
+        this.switchToMyCar();
         break;
       }
       case "jump-to-fastest-lap": {
