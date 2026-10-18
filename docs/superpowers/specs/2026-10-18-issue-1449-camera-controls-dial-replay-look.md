@@ -4,7 +4,7 @@
 >
 > Point-in-time design record. The code and `.claude/rules/` are the truth; this is not documentation.
 
-Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dial-surface.ts`: `renderCameraCarousel`, `renderSubCameraCarousel`, `renderCarCarousel`, `renderRacePositionCarousel`, and `renderKnobCarousel` for the Mirabox knob). The Replay Control dial draws the shared dash box (`shared/dial-box.ts`) that most of the plugin's dials use: a label, a value, a caption, side marks, and, from #801, the neighbours beside the value. With #801 (`2026-10-12-issue-801-replay-control-dial-stepping.md`) and #1448 (`2026-10-18-issue-1448-replay-dial-camera-car-modes.md`), Track Order, Car # and Position exist on both dials, drawn two ways. The maintainer prefers the replay dial's look (2026-10-18: "This look is better than what Camera Controls has.") and chose to restyle Camera Controls' dial in an issue of its own, after #1448 (2026-10-18). It is built after both.
+Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dial-surface.ts`: `renderCameraCarousel`, `renderSubCameraCarousel`, `renderCarCarousel`, `renderRacePositionCarousel`, and `renderKnobCarousel` for the Mirabox knob). The Replay Control dial draws the shared dash box (`shared/dial-box.ts`) that most of the plugin's dials use: a label, a value, a caption, side marks, and, from #801, the neighbours beside the value. With #801 (`2026-10-12-issue-801-replay-control-dial-stepping.md`) and #1448 (`2026-10-18-issue-1448-replay-dial-camera-car-modes.md`), Track Order, Car # and Position exist on both dials, drawn two ways. The maintainer prefers the replay dial's look (2026-10-18: "This look is better than what Camera Controls has.") and chose to restyle Camera Controls' dial in an issue of its own, after #1448 (2026-10-18). It is built after #801, #1448 and #1437: it changes `shared/dial-box.ts`, which #801 (the neighbour slot) and #1437 (the busy look) change too, so it lands after both and rebases onto them.
 
 ## The decision
 
@@ -14,21 +14,34 @@ Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dia
 
    | Mode | Label | Value | Neighbours | Caption | Side marks |
    | --- | --- | --- | --- | --- | --- |
-   | Camera | `CAMERA` | the group name | none | none | both lit |
-   | Sub-camera | `SUB-CAMERA` | the camera name | none | none | both lit |
+   | Camera | `CAMERA` | the group's icon and name | the dimmed neighbouring groups of the enabled subset, one detent either way | none | both lit |
+   | Sub-camera | `SUB-CAMERA` | the camera name | the dimmed neighbouring cameras from the group's `Cameras[]`, a guide as today (#852) | none | both lit |
    | Car # | `CAR #` | `#12` | the car numbers one detent either way | none | both lit |
    | Position | `POSITION` | `P4` | the positions one detent either way | `#12` | lit where a detent that way has a car |
    | Track Order | `TRACK ORDER` | `#12` | as #801: the cars ahead and behind, where the positions can be trusted | none | both lit |
-   | Driving Cam | `DRIVING CAM` | the group name | none | none | both lit |
+   | Driving Cam | `DRIVING CAM` | the group's icon and name | none, as today: iRacing resolves `group ± 1` itself | none | both lit |
 
    The labels are the strip's top line today. Position here keeps Camera Controls' order as it is (the canonical order, the official one as fallback); the replay dial's `P--` rule for a replay scrubbed back in a live session (#1448) is that dial's, and Camera Controls is not changed in what it does.
-4. **The camera modes lose their group icons and their neighbour names.** The box has a text value and no icon slot, and #801's neighbour slot is sized for a car number or a position, not a camera or group name. Camera and Driving Cam show the group name alone, and Sub-camera the camera name alone, with both side marks lit. This is the one thing the look takes away, and the open question below.
+4. **The camera modes keep their group icons and their neighbour names** (maintainer, 2026-10-18, chosen over dropping them): the shared box gains the slots for them (below).
 5. **The per-mode accents stay** (`MODE_COLOR`) as the box's default accent per mode, and the user's colour overrides (`dialAppearanceFields`) apply as they do today.
 6. **Out of a session** each mode shows the box dimmed with its label, as the replay dial does, in place of today's plain identity label.
 
-## Open question
+## The box's new slots
 
-**The camera modes' icons and neighbours.** The decision drops the group icons and the dimmed neighbour names for Camera, Sub-camera and Driving Cam. Should they go, as decided here, or should the shared box gain an icon slot and a wider neighbour slot for them? That would be a change to a renderer fourteen dials share.
+The shared dash box (`shared/dial-box.ts`, drawn by `dial-strip-box.ts` and `dial-knob-box.ts`) gains two optional arguments, on the strip and on the knob:
+
+- **An icon** beside the value: Camera Controls' group icons, drawn as the carousel draws them today, the value fitted into what is left.
+- **Neighbours that take a name**, not only a number: #801's neighbour slot widened to fit a short text either side, dimmed, fitted by the box like the value and cut with an ellipsis where it cannot fit.
+
+**Every dial that does not pass them is drawn byte for byte as before.** Fourteen dials and more draw this box (the seven Setup dials, Camera Editor Adjustments, Cockpit Misc, Force Feedback, Replay Control, Replay Markers, Splits & Reference, View Adjustment, Black Box Selector, and Replay Control's new modes). A test pins it: each of those dials' boxes, rendered with representative arguments on the strip and on the knob, is compared with its SVG as rendered on `master` before this change, captured once as fixtures in the same change and refused if it differs by a byte.
+
+## Review
+
+`/code-review high`: a shared renderer that fourteen dials use is still ordinary domain code. It holds no persisted data, decides no stored setting and is no published contract, so it is not the `xhigh` row. The byte-identity test is what carries the risk of a change to every dial. No second read: the diff is not a gate, a build or publish path, or a state machine.
+
+## The maintainer's decision (2026-10-18)
+
+**The camera modes keep their icons and neighbours**: the shared box gains an icon slot and wider neighbour slots, and every dial that does not use them stays byte-identical, pinned by tests.
 
 ## Out of scope
 
@@ -41,7 +54,8 @@ Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dia
 
 **Unit:**
 
-- Each mode's box: label, value, neighbours, caption and side marks, on the strip and on the knob; a long group or camera name fitted by the box; out of a session, the dimmed box.
+- Each mode's box: label, value, icon, neighbours, caption and side marks, on the strip and on the knob; a long group or camera name fitted by the box, and a long neighbour name cut with an ellipsis; out of a session, the dimmed box.
+- **Byte identity**: every other dial's box, on the strip and on the knob, renders byte for byte as the fixtures captured on `master` before the change; the test fails on a planted one-byte change to the renderer.
 - The camera-car modes' boxes are the same as the replay dial's for the same camera car and field (one helper, or the same expectations in both suites).
 - The #612 warning drawn on Sub-camera and Track Order with a binding missing, and on no other mode.
 - The hold preview: Focus My Car's car number in the value slot with the pending bar, the side marks unchanged.
