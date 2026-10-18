@@ -36,24 +36,25 @@ Car # and Position are number-primary: a clockwise detent makes the number on th
    | Caption | none | the camera car's number, `#12` |
    | Side marks | both lit | lit where a detent that way has a car to go to |
 
-   Car # needs no trust rule: the car list is the session's, and a camera switch to any car works in a replay (#1281). Position does: the race order is read from the per-car arrays, which are the replay's own only in a saved replay and at the live edge of an in-session replay (#1281's capture, #801's Track Order rule). Where they are not, the box shows the car number with `P--` and no neighbours, and a detent sends nothing and logs it at debug. A position stepped from the live field would focus a car the replay on screen does not place there. This is the open question below.
+   Car # needs no trust rule: the car list is the session's, and a camera switch to any car works in a replay (#1281). Position does: the race order is read from the per-car arrays, which are the replay's own only in a saved replay and at the live edge of an in-session replay (#1281's capture, #801's Track Order rule). Where they are not, the box shows the car number with `P--` and no neighbours, and a detent sends nothing and logs it at debug: a position stepped from the live field would focus a car the replay on screen does not place there (maintainer, 2026-10-18, chosen over stepping by car number there).
 5. **The camera switch goes out as #801's Track Order does.** iRacing drops a camera change that arrives during a position jump's seek (#1430's capture: 9 of 9 and 3 of 3), so a detent waits until no jump is under way: `waitForReplaySettled({ jumpsOnly: true })` with no claim, bounded by `REPLAY_JUMP_MAX_WAIT_MS`. A search on its way does not hold it, since a camera change during a search is acted on and harmless (8 of 8). The detent cancels a cursor owner only when it is one of the two camera-riding walks (Jump to Fastest Lap's and Jump to Race Start's), checked by owner as #801's Car tap does it, and leaves a marker jump or a record jump's run standing. A newer detent replaces one still waiting, and the target is worked out when the switch goes out, from the camera car then.
 6. **Long Press's Mode default** (#801's `mode-default`) runs Jump to My Car in Car # and Position too, as it does in Track Order.
 
 ## How Camera Controls' own dial relates
 
-Open, for the maintainer. Camera Controls' dial is left as it is by this issue; the two dials then show the same mode in two looks. Whether Camera Controls' dial moves to the replay dial's box later, as its own issue, or stays as it is (its carousel draws group icons and camera names, which the replay box has no slot for), is the maintainer's call.
+Unchanged by this issue. The maintainer chose (2026-10-18) to restyle it to the replay dial's look later, in an issue of its own: #1449 (`2026-10-18-issue-1449-camera-controls-dial-replay-look.md`). Until then the two dials draw the same camera-car modes in two looks.
 
-## Open questions
+## The maintainer's decisions (2026-10-18)
 
-1. **Camera Controls' own dial**: leave it as it is, or restyle it later to the replay dial's look in an issue of its own?
-2. **The camera modes** (Camera, Sub-camera, Driving Cam): this spec brings only the two camera-car modes, the "similar modes as Track Order". Should the three camera-angle modes come to the replay dial too, or stay Camera Controls' only?
-3. **Position where the order cannot be trusted** (scrubbed back in an in-session replay): the spec shows the car number with `P--` and sends nothing on a detent. The alternative is to step by car number there and say so on the box. Which?
+1. **Camera Controls' own dial** is restyled later, in #1449; this issue does not touch it.
+2. **The camera-angle modes** (Camera, Sub-camera, Driving Cam) do not come to the replay dial: Car # and Position only.
+3. **Position after scrubbing back in an in-session replay** shows `P--`, and a detent sends nothing, as decided above.
 
 ## Out of scope
 
 - **Changing Camera Controls' dial or keypad.** Only the shared target helpers move to `shared/`, with no change in behaviour.
-- **Camera, Sub-camera and Driving Cam on the replay dial** (open question 2).
+- **Camera, Sub-camera and Driving Cam on the replay dial** (the maintainer's decision 2).
+- **Restyling Camera Controls' dial** (#1449).
 - **A `reverseRotation` setting** for the Replay Control dial.
 - **A car or camera key pressed during a jump** (#1435) and Camera Controls' own sends in a replay: the waits here are the replay dial's.
 - **Ulanzi dials**, which are not declared.
