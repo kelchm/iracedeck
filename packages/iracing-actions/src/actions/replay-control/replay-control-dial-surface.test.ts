@@ -9,11 +9,16 @@ import type { ReplaySessionStore } from "@iracedeck/replay-store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { labelClearsSideMarks } from "../../shared/dial-label-fit.js";
+import { registerReplayBusySurface, type ReplayBusyLook } from "../../shared/replay-busy-indicator.js";
 import {
   _configureReplayCommandGate,
   _resetReplayCommandGate,
   getReplayGateRecord,
+  getReplayGateView,
+  isReplayMoveUnderWay,
   pressReplayCommand,
+  type ReplayGateNotice,
+  subscribeReplayGate,
 } from "../../shared/replay-command-gate.js";
 import {
   _resetReplayCursor,
@@ -27,11 +32,13 @@ import type { ReplayDialModeIo, ReplaySpeed } from "./replay-control-dial-mode.j
 import { REPLAY_DIAL_MODES, ReplayControlDialSettings } from "./replay-control-dial-settings.js";
 import {
   buildTriggerDescription,
+  CAPTION_GIVES_WAY_TO_MARK,
   DIAL_MODES,
   REPLAY_DIAL_MODE_LABELS,
   ReplayControlDialSurface,
   type ReplayDialReading,
   resolveDialGesture,
+  TURN_DRAWS_WORKING,
 } from "./replay-control-dial-surface.js";
 import { frameJogMode } from "./replay-control-frame-jog.js";
 import { incidentMode } from "./replay-control-incident-mode.js";
@@ -56,12 +63,15 @@ const queue = vi.hoisted(() => ({
   turns: [] as Array<{ target: string; ticks: number; origin: string; owner: string }>,
   pending: null as { target: string; count: number; origin: string } | null,
   running: null as string | null,
+  /** Called as a turn is queued, for a test that asks what stood when it went out. */
+  onTurn: null as null | (() => void),
   listeners: new Set<() => void>(),
   speedListeners: new Set<(speed: { speed: number; slowMotion: boolean }) => void>(),
 }));
 
 vi.mock("./replay-search-queue.js", () => ({
   queueReplaySearch: (turn: { target: string; ticks: number; origin: string; owner: string }) => {
+    queue.onTurn?.();
     queue.turns.push(turn);
   },
   pendingReplaySearch: () => queue.pending,
@@ -93,6 +103,7 @@ const mocks = vi.hoisted(() => ({
   nextFrame: vi.fn(() => true),
   prevFrame: vi.fn(() => true),
   setPlayPosition: vi.fn((_mode: number, _frame: number) => true),
+  nextSession: vi.fn(() => true),
   thresholdMs: { value: 500 },
 }));
 
@@ -108,6 +119,7 @@ vi.mock("@iracedeck/deck-iracing", () => ({
       prevFrame: mocks.prevFrame,
       setPlayPosition: mocks.setPlayPosition,
       nextLap: mocks.nextLap,
+      nextSession: mocks.nextSession,
     },
   }),
 }));
@@ -135,6 +147,48 @@ vi.mock("@iracedeck/deck-core", async () => {
     escapeXml: (str: string) => str,
     // Identity, so a test reads the pushed SVG straight off `setDialCanvas`.
     svgToDataUri: (svg: string) => svg,
+  };
+});
+
+/** A busy surface as the dial registers it (#1437). */
+interface BusySurface {
+  readonly token: string;
+  readonly drawsWorking: boolean;
+  redraw(look: ReplayBusyLook): void;
+}
+
+// The replay busy indicator (#1437), driven by hand: a test sets a token's look
+// and calls the redraw the surface registered, as the indicator's tick would.
+// With `real` set, registration and the look go through the REAL indicator over
+// the real gate, for the cases that hang on what it does with a registration.
+const busy = vi.hoisted(() => ({
+  looks: new Map<string, ReplayBusyLook>(),
+  surfaces: new Map<string, BusySurface>(),
+  unregistered: [] as string[],
+  real: false,
+  actual: null as null | typeof import("../../shared/replay-busy-indicator.js"),
+}));
+
+vi.mock("../../shared/replay-busy-indicator.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../shared/replay-busy-indicator.js")>();
+
+  busy.actual = actual;
+
+  return {
+    registerReplayBusySurface: vi.fn((surface: BusySurface) => {
+      busy.surfaces.set(surface.token, surface);
+
+      const unregisterReal = busy.real ? actual.registerReplayBusySurface(surface) : () => undefined;
+
+      return () => {
+        busy.unregistered.push(surface.token);
+        unregisterReal();
+
+        if (busy.surfaces.get(surface.token) === surface) busy.surfaces.delete(surface.token);
+      };
+    }),
+    getReplayBusyLook: (token: string): ReplayBusyLook =>
+      busy.real ? actual.getReplayBusyLook(token) : (busy.looks.get(token) ?? { kind: "rest" }),
   };
 });
 
@@ -339,6 +393,7 @@ describe("ReplayControlDialSurface", () => {
     queue.turns.length = 0;
     queue.pending = null;
     queue.running = null;
+    queue.onTurn = null;
     queue.listeners.clear();
     queue.speedListeners.clear();
     host.isBindingMissing.mockReturnValue(false);
@@ -3650,5 +3705,624 @@ describe("resolveDialGesture", () => {
       expect(resolveDialGesture("play-pause", mode)).toBe("play-pause");
       expect(resolveDialGesture("none", mode)).toBeNull();
     }
+  });
+});
+
+describe("ReplayControlDialSurface — the busy look (#1437)", () => {
+  /** Sets `token`'s look and redraws its surface, as the indicator does. */
+  function showLook(look: ReplayBusyLook, token = "dial-1"): void {
+    busy.looks.set(token, look);
+    busy.surfaces.get(token)?.redraw(look);
+  }
+
+  /** The caption mark the box draws: its kind, and the lit dot of a working one. */
+  function shownMark(svg: string): string {
+    const mark = /<g data-caption-mark="([\w-]+)">(.*?)<\/g>/.exec(svg);
+
+    if (!mark) return "none";
+
+    if (mark[1] !== "working") return mark[1];
+
+    const lit = [...mark[2].matchAll(/<circle [^>]*\/>/g)].findIndex((dot) => !dot[0].includes("opacity"));
+
+    return `working ${lit}`;
+  }
+
+  /** The first `<text>` of the box: the label, which the mark never moves. */
+  function labelText(svg: string): string | undefined {
+    return /<text[^>]*>[^<]*<\/text>/.exec(svg)?.[0];
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    _resetReplayCursor();
+    _resetReplaySpeedState();
+    _resetReplayPositionState();
+    _resetReplayCommandGate();
+    _configureReplayCommandGate({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
+    env.inReplay = true;
+    env.telemetry = replayAt(speed(1));
+    mocks.thresholdMs.value = 500;
+    mocks.setPlaySpeed.mockReturnValue(true);
+    mocks.pause.mockReturnValue(true);
+    busy.looks.clear();
+    busy.surfaces.clear();
+    busy.unregistered.length = 0;
+    busy.real = false;
+    busy.actual?._resetReplayBusyIndicator();
+  });
+
+  afterEach(() => {
+    busy.actual?._resetReplayBusyIndicator();
+    busy.real = false;
+    host.jumpToLive.mockImplementation(() => undefined);
+    host.jumpToRaceStart.mockImplementation(() => undefined);
+    vi.useRealTimers();
+  });
+
+  describe("registration", () => {
+    it("keeps a not done the box is showing across a settings change that re-registers it", async () => {
+      busy.real = true;
+      const { surface, ctx } = await onScreen(speed(1));
+
+      busy.actual!.reportReplayPressIgnored("dial-1");
+      await settle();
+
+      expect(shownMark(lastBox(ctx))).toBe("not-done");
+
+      await surface.didReceiveSettings(ctx as never, dial({ pressAction: "jump-to-live" }));
+
+      expect(registerReplayBusySurface).toHaveBeenCalledTimes(2);
+      expect(busy.actual!.getReplayBusyLook("dial-1")).toEqual({ kind: "not-done" });
+      await settle();
+      expect(shownMark(lastBox(ctx))).toBe("not-done");
+
+      // Its second runs out as it would have without the change.
+      await settle(1_000);
+      expect(shownMark(lastBox(ctx))).toBe("none");
+    });
+
+    it("registers the dial under its context id on appear, and unregisters it on disappear", async () => {
+      const { surface, ctx } = await onScreen(speed(1));
+
+      expect(registerReplayBusySurface).toHaveBeenCalledTimes(1);
+      expect(busy.surfaces.get("dial-1")).toMatchObject({ token: "dial-1", drawsWorking: false });
+
+      surface.willDisappear(ctx.id);
+
+      expect(busy.unregistered).toEqual(["dial-1"]);
+      expect(busy.surfaces.has("dial-1")).toBe(false);
+    });
+
+    it("on appear draws working as the push slot does: true when it jumps or searches", async () => {
+      for (const gesture of ["jump-to-live", "jump-to-race-start"]) {
+        busy.surfaces.clear();
+        await onScreen(speed(1), dial({ pressAction: gesture }));
+
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+      }
+    });
+
+    it.each(["longPressAction", "tapAction", "longTouchAction"])(
+      "on appear draws no working for a jump on %s alone: that gesture decides when it fires",
+      async (slot) => {
+        await onScreen(speed(1), dial({ [slot]: "jump-to-live" }));
+
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+      },
+    );
+
+    it("draws no working when every slot is a speed gesture or none", async () => {
+      await onScreen(speed(1), dial({ pressAction: "reverse", longPressAction: "none", tapAction: "set-1x-play" }));
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+    });
+
+    it("re-registers when a settings change makes the push slot a jump, and only then", async () => {
+      const { surface, ctx } = await onScreen(speed(1));
+
+      // The rotation mode, and a jump on another slot, change nothing until a gesture fires.
+      await surface.didReceiveSettings(ctx as never, dial({ mode: "frame-jog" }));
+      await surface.didReceiveSettings(ctx as never, dial({ longPressAction: "jump-to-live" }));
+
+      expect(registerReplayBusySurface).toHaveBeenCalledTimes(1);
+
+      await surface.didReceiveSettings(ctx as never, dial({ pressAction: "jump-to-live" }));
+
+      expect(registerReplayBusySurface).toHaveBeenCalledTimes(2);
+      expect(busy.unregistered).toEqual(["dial-1"]);
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+
+      await surface.didReceiveSettings(ctx as never, dial());
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+    });
+
+    it("a gesture re-registers the dial with its own kind before its press reaches the gate", async () => {
+      // Push is a speed gesture, hold a jump: the box follows whichever fired.
+      const d = dial({ pressAction: "play-pause", longPressAction: "jump-to-live" });
+      const { surface, ctx } = await onScreen(speed(1), d);
+      const seen: string[] = [];
+
+      host.jumpToLive.mockImplementation(() => {
+        seen.push(`jump-to-live drawsWorking=${busy.surfaces.get("dial-1")?.drawsWorking}`);
+      });
+      mocks.pause.mockImplementation(() => {
+        seen.push(`pause drawsWorking=${busy.surfaces.get("dial-1")?.drawsWorking}`);
+
+        return true;
+      });
+
+      await press(surface, ctx, d, 600);
+      await settle(DIAL_SPEED_HOLD_MS);
+      await press(surface, ctx, d);
+
+      expect(seen).toEqual(["jump-to-live drawsWorking=true", "pause drawsWorking=false"]);
+    });
+
+    it("the gesture's kind outlasts a settings change", async () => {
+      const d = dial({ pressAction: "play-pause", longPressAction: "jump-to-live" });
+      const { surface, ctx } = await onScreen(speed(1), d);
+
+      await press(surface, ctx, d, 600);
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+
+      await surface.didReceiveSettings(ctx as never, dial({ pressAction: "reverse", longPressAction: "jump-to-live" }));
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+    });
+
+    it("a speed gesture whose takeover jump is under way on its token draws rest, and still waiting and not done", async () => {
+      busy.real = true;
+      // A jump on the hold, so the dial has drawn working before the speed gesture fires.
+      const d = dial({ pressAction: "play-pause", longPressAction: "jump-to-live" });
+      const { surface, ctx } = await onScreen(speed(1), d);
+
+      await press(surface, ctx, d, 600);
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+
+      // A key's search goes out on the playing replay.
+      expect(
+        pressReplayCommand({ kind: "search", search: "nextSession" }, { by: "next-session", origin: "key-1" }),
+      ).toEqual({
+        kind: "sent",
+        ok: true,
+      });
+
+      // Play/Pause behind it waits.
+      await press(surface, ctx, d);
+      await settle();
+
+      expect(getReplayGateView("dial-1").waiting).not.toBeNull();
+      expect(shownMark(lastBox(ctx))).toBe("waiting");
+
+      // Pressed again, it takes over: the pause and a short jump beside the reading, under the dial's token.
+      await press(surface, ctx, d);
+      await settle();
+
+      expect(getReplayGateView("dial-1")).toMatchObject({ underWay: expect.anything(), waiting: null });
+      expect(busy.actual!.getReplayBusyLook("dial-1")).toEqual({ kind: "rest" });
+      expect(shownMark(lastBox(ctx))).toBe("none");
+
+      // The replay never moves, so the takeover's jump is given up: not done.
+      const marks = new Set<string>();
+
+      for (let i = 0; i < 120 && getReplayGateView("dial-1").underWay !== null; i++) {
+        await settle(500);
+        marks.add(shownMark(lastBox(ctx)));
+      }
+
+      expect(getReplayGateView("dial-1").underWay).toBeNull();
+      expect(marks).toContain("not-done");
+      expect(marks).not.toContain("working 0");
+    });
+
+    it("draws working for a turn only in the modes whose turn jumps or searches under the dial's token", () => {
+      expect(TURN_DRAWS_WORKING).toEqual({
+        speed: false,
+        "frame-jog": false,
+        lap: true,
+        session: true,
+        incident: true,
+        "track-order": false,
+      });
+    });
+
+    it.each(["lap", "session", "incident"])("on appear in %s draws working, as its turn would", async (mode) => {
+      await onScreen(PAUSED, dial({ mode, pressAction: "play-pause" }));
+
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+    });
+
+    it.each(["speed", "frame-jog", "track-order"])(
+      "on appear in %s draws working only as its push slot does",
+      async (mode) => {
+        await onScreen(PAUSED, dial({ mode, pressAction: "play-pause" }));
+
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+      },
+    );
+
+    it.each(["lap", "session", "incident"])(
+      "in %s, a turn re-registers the dial as drawing working before it goes out, the new entry first",
+      async (mode) => {
+        const d = dial({ mode, pressAction: "play-pause" });
+        const { surface, ctx } = await onScreen(PAUSED, d);
+
+        // A speed gesture first, so the dial is registered drawing no working.
+        await press(surface, ctx, d);
+        await settle(DIAL_SPEED_HOLD_MS);
+
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+
+        const unregisteredBefore = busy.unregistered.length;
+        const seen: boolean[] = [];
+
+        queue.onTurn = () => seen.push(busy.surfaces.get("dial-1")?.drawsWorking === true);
+        surface.rotate(ctx as never, d, 1, false);
+
+        expect(queue.turns.at(-1)).toMatchObject({ target: mode, ticks: 1, origin: "dial-1" });
+        expect(seen).toEqual([true]);
+        // Registered anew, then the old entry let go: the mock drops the token only when its own entry goes.
+        expect(busy.unregistered.length).toBe(unregisteredBefore + 1);
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+
+        // A second turn changes nothing; a press of the speed gesture goes back.
+        surface.rotate(ctx as never, d, 1, false);
+        expect(registerReplayBusySurface).toHaveBeenCalledTimes(3);
+        await press(surface, ctx, d);
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+      },
+    );
+
+    it.each(["speed", "frame-jog", "track-order"])("in %s, a turn leaves the registration as it is", async (mode) => {
+      const d = dial({ mode, pressAction: "play-pause" });
+      const { surface, ctx } = await onScreen(PAUSED, d);
+
+      surface.rotate(ctx as never, d, 1, false);
+      surface.rotate(ctx as never, d, -1, false);
+      await settle();
+
+      expect(registerReplayBusySurface).toHaveBeenCalledTimes(1);
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+    });
+
+    it("draws working for the run a stepping turn started, through the real indicator", async () => {
+      busy.real = true;
+      const d = dial({ mode: "session", pressAction: "play-pause" });
+      const { surface, ctx } = await onScreen(speed(1), d);
+
+      await press(surface, ctx, d);
+      await settle(DIAL_SPEED_HOLD_MS);
+      expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+
+      // The replay plays again, so the search below runs as on a playing replay.
+      nowPlaying(speed(1));
+      surface.rotate(ctx as never, d, 1, false);
+      // The runner's search goes out under the token the turn handed it (the runner is a double here).
+      expect(
+        pressReplayCommand(
+          { kind: "search", search: "nextSession" },
+          { by: "replay-control-dial session", origin: "dial-1" },
+        ),
+      ).toEqual({ kind: "sent", ok: true });
+      await settle();
+
+      expect(busy.actual!.getReplayBusyLook("dial-1")).toMatchObject({ kind: "working" });
+      expect(shownMark(lastBox(ctx))).toMatch(/^working \d$/);
+    });
+
+    it.each([
+      ["Reverse on a paused replay", "reverse"],
+      ["Jump to My Car", "jump-to-my-car"],
+    ])(
+      "a gesture that sends nothing (%s) leaves the dial's own search drawn working, through the real indicator",
+      async (_name, gesture) => {
+        busy.real = true;
+        const d = dial({ mode: "lap", pressAction: gesture });
+        const { surface, ctx } = await onScreen(PAUSED, d);
+
+        // The turn's paced search goes out under the dial's token (the runner is a double here).
+        surface.rotate(ctx as never, d, 1, false);
+        expect(
+          pressReplayCommand(
+            { kind: "search", search: "nextLap" },
+            { by: "replay-control-dial lap", origin: "dial-1" },
+          ),
+        ).toEqual({ kind: "sent", ok: true });
+        await settle();
+
+        expect(busy.actual!.getReplayBusyLook("dial-1")).toMatchObject({ kind: "working" });
+
+        const registrations = vi.mocked(registerReplayBusySurface).mock.calls.length;
+        mocks.setPlaySpeed.mockClear();
+        mocks.pause.mockClear();
+
+        await press(surface, ctx, d);
+        await settle();
+
+        // Nothing went to the gate, so the registration and the look stand.
+        expect(mocks.setPlaySpeed).not.toHaveBeenCalled();
+        expect(mocks.pause).not.toHaveBeenCalled();
+        expect(registerReplayBusySurface).toHaveBeenCalledTimes(registrations);
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(true);
+        expect(busy.actual!.getReplayBusyLook("dial-1")).toMatchObject({ kind: "working" });
+        expect(shownMark(lastBox(ctx))).toMatch(/^working \d$/);
+      },
+    );
+
+    it.each(["jump-to-live", "jump-to-race-start"])(
+      "%s re-registers the dial as drawing working before its press, from a speed gesture's registration",
+      async (gesture) => {
+        const d = dial({ pressAction: "play-pause", longPressAction: gesture });
+        const { surface, ctx } = await onScreen(speed(1), d);
+        const seen: boolean[] = [];
+        const record = (): undefined => {
+          seen.push(busy.surfaces.get("dial-1")?.drawsWorking === true);
+
+          return undefined;
+        };
+
+        await press(surface, ctx, d);
+        await settle(DIAL_SPEED_HOLD_MS);
+        expect(busy.surfaces.get("dial-1")?.drawsWorking).toBe(false);
+
+        host.jumpToLive.mockImplementation(record);
+        host.jumpToRaceStart.mockImplementation(record);
+        await press(surface, ctx, d, 600);
+
+        expect(seen).toEqual([true]);
+      },
+    );
+
+    it("hands Jump to Live and Jump to Race Start the dial's token", async () => {
+      const { surface, ctx } = await onScreen(speed(1));
+
+      await press(surface, ctx, dial({ pressAction: "jump-to-live" }));
+      await press(surface, ctx, dial({ pressAction: "jump-to-race-start" }));
+
+      expect(host.jumpToLive).toHaveBeenCalledWith("dial-1");
+      expect(host.jumpToRaceStart).toHaveBeenCalledWith("dial-1");
+    });
+  });
+
+  describe("the box", () => {
+    it("draws the look at the left of the caption line, and nothing at rest", async () => {
+      const { ctx } = await onScreen(speed(1), dial({ pressAction: "jump-to-live" }));
+
+      expect(shownMark(lastBox(ctx))).toBe("none");
+
+      for (const [look, mark] of [
+        [{ kind: "working", tick: 0 }, "working 0"],
+        [{ kind: "waiting" }, "waiting"],
+        [{ kind: "not-done" }, "not-done"],
+        [{ kind: "rest" }, "none"],
+      ] as const) {
+        showLook(look);
+        await settle();
+
+        expect(shownMark(lastBox(ctx))).toBe(mark);
+      }
+    });
+
+    it("draws today's box at rest", async () => {
+      const plain = await onScreen(speed(1));
+      const registered = await onScreen(speed(1), dial(), dialContext("dial-2"));
+
+      showLook({ kind: "rest" }, "dial-2");
+      await settle();
+
+      expect(lastBox(registered.ctx)).toBe(lastBox(plain.ctx));
+      expect(lastBox(registered.ctx)).not.toContain("data-caption-mark");
+    });
+
+    it("steps the mark on every second tick: positions 0, 0, 1, 1, 2, 2, 0", async () => {
+      const { ctx } = await onScreen(speed(1), dial({ pressAction: "jump-to-live" }));
+      const shown: string[] = [];
+
+      for (let tick = 0; tick < 7; tick++) {
+        showLook({ kind: "working", tick });
+        await settle(125);
+        shown.push(shownMark(lastBox(ctx)));
+      }
+
+      expect(shown).toEqual([
+        "working 0",
+        "working 0",
+        "working 1",
+        "working 1",
+        "working 2",
+        "working 2",
+        "working 0",
+      ]);
+    });
+
+    it("pushes only when the mark moves: four frames a second at the indicator's eight ticks", async () => {
+      const { ctx } = await onScreen(speed(1), dial({ pressAction: "jump-to-live" }));
+      ctx.setDialCanvas.mockClear();
+
+      for (let tick = 0; tick < 16; tick++) {
+        showLook({ kind: "working", tick });
+        await settle(125);
+      }
+
+      expect(ctx.setDialCanvas).toHaveBeenCalledTimes(8);
+    });
+
+    it("keeps pushes under the throttle however fast the look changes", async () => {
+      const { ctx } = await onScreen(speed(1), dial({ pressAction: "jump-to-live" }));
+      const pushedAt: number[] = [];
+      ctx.setDialCanvas.mockClear();
+      ctx.setDialCanvas.mockImplementation(() => {
+        pushedAt.push(Date.now());
+
+        return Promise.resolve();
+      });
+
+      // A redraw every 20 ms, each moving the mark: fifty in a second.
+      for (let i = 0; i < 50; i++) {
+        showLook({ kind: "working", tick: i * 2 });
+        await settle(20);
+      }
+
+      await settle(200);
+
+      expect(pushedAt.length).toBeGreaterThan(5);
+      expect(pushedAt.length).toBeLessThanOrEqual(11);
+      pushedAt.slice(1).forEach((at, i) => expect(at - pushedAt[i]).toBeGreaterThanOrEqual(100));
+    });
+
+    it("replaces the play-state caption with the mark, leaving the label and the value where they were", async () => {
+      for (const canvas of [STRIP, KNOB]) {
+        busy.surfaces.clear();
+        busy.looks.clear();
+        const { surface, ctx } = await onScreen(speed(1), dial({ mode: "frame-jog" }), dialContext("dial-1", canvas));
+        const before = lastBox(ctx);
+
+        expect(shownCaption(before)).not.toBe("");
+
+        showLook({ kind: "waiting" });
+        await settle();
+
+        const after = lastBox(ctx);
+
+        expect(shownCaption(after)).toBe("");
+        expect(shownMark(after)).toBe("waiting");
+        expect(shownValue(after)).toBe(shownValue(before));
+        // Every text but the caption — the label, and the value when there is one — is drawn as before.
+        expect(after.match(/<text(?! data-caption)[^>]*>[^<]*<\/text>/g)).toEqual(
+          before.match(/<text(?! data-caption)[^>]*>[^<]*<\/text>/g),
+        );
+        expect(labelText(after)).toBe(labelText(before));
+        surface.willDisappear(ctx.id);
+      }
+    });
+
+    it("lets only the play state give way to the mark: every stepping mode's caption stays beside it", () => {
+      expect(CAPTION_GIVES_WAY_TO_MARK).toEqual({
+        speed: true,
+        "frame-jog": true,
+        lap: false,
+        session: false,
+        incident: false,
+        "track-order": false,
+      });
+    });
+
+    describe.each([STRIP, KNOB])("#801's pending count and the mark on $id", (canvas) => {
+      /** Every text but the caption's: the label and the value, which neither the count nor the mark moves. */
+      const aboveCaption = (svg: string) => svg.match(/<text(?! data-caption)[^>]*>[^<]*<\/text>/g);
+
+      beforeEach(() => {
+        queue.pending = null;
+      });
+
+      afterEach(() => {
+        queue.pending = null;
+      });
+
+      async function setCount(count: number | null): Promise<void> {
+        queue.pending = count === null ? null : { target: "incident", count, origin: "dial-1" };
+
+        for (const listener of queue.listeners) listener();
+
+        await settle();
+      }
+
+      it("draws the count alone, the count with the mark beside it, and the mark alone", async () => {
+        const { ctx } = await onScreen(PAUSED, dial({ mode: "incident" }), dialContext("dial-1", canvas));
+        const idle = lastBox(ctx);
+
+        expect(shownCaption(idle)).toBe("");
+        expect(shownMark(idle)).toBe("none");
+
+        await setCount(3);
+        const countAlone = lastBox(ctx);
+
+        expect(shownCaption(countAlone)).toBe("+3");
+        expect(shownMark(countAlone)).toBe("none");
+
+        showLook({ kind: "working", tick: 2 });
+        await settle();
+        const both = lastBox(ctx);
+
+        expect(shownCaption(both)).toBe("+3");
+        expect(shownMark(both)).toBe("working 1");
+
+        // The count's left edge (the renderer's 0.6 em estimate) is clear of the mark's right edge.
+        const textX = Number(/<text data-caption="true" x="([\d.]+)"/.exec(both)![1]);
+        const fontSize = Number(/<text data-caption="true"[^>]*font-size="(\d+)"/.exec(both)![1]);
+        const markRight = Math.max(
+          ...[...both.matchAll(/<circle cx="([\d.]+)"[^>]*r="([\d.]+)"/g)].map((m) => Number(m[1]) + Number(m[2])),
+        );
+
+        expect(textX - ("+3".length * 0.6 * fontSize) / 2).toBeGreaterThan(markRight);
+
+        await setCount(null);
+        const markAlone = lastBox(ctx);
+
+        expect(shownCaption(markAlone)).toBe("");
+        expect(shownMark(markAlone)).toBe("working 1");
+
+        // The value has one size and place throughout: the line is kept whether or not the count shows.
+        for (const svg of [countAlone, both, markAlone]) expect(aboveCaption(svg)).toEqual(aboveCaption(idle));
+      });
+
+      it("keeps a waiting or not-done mark beside the count too", async () => {
+        const { ctx } = await onScreen(PAUSED, dial({ mode: "incident" }), dialContext("dial-1", canvas));
+
+        await setCount(-2);
+
+        for (const [look, mark] of [
+          [{ kind: "waiting" }, "waiting"],
+          [{ kind: "not-done" }, "not-done"],
+        ] as const) {
+          showLook(look);
+          await settle();
+
+          expect(shownCaption(lastBox(ctx))).toBe("-2");
+          expect(shownMark(lastBox(ctx))).toBe(mark);
+        }
+      });
+    });
+
+    it("draws nothing for a redraw after the dial has gone", async () => {
+      const { surface, ctx } = await onScreen(speed(1), dial({ pressAction: "jump-to-live" }));
+      const redraw = busy.surfaces.get("dial-1")!.redraw;
+
+      surface.willDisappear(ctx.id);
+      ctx.setDialCanvas.mockClear();
+      busy.looks.set("dial-1", { kind: "working", tick: 0 });
+      redraw({ kind: "working", tick: 0 });
+      await settle();
+
+      expect(ctx.setDialCanvas).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("a turn carries no token", () => {
+    it.each(["speed", "frame-jog"] as const)("a %s turn never puts the dial's token in the gate", async (mode) => {
+      const notices: ReplayGateNotice[] = [];
+      const unsubscribe = subscribeReplayGate((notice) => notices.push(notice));
+      const { surface, ctx } = await onScreen(PAUSED, dial({ mode }));
+      let underWaySeen = false;
+
+      for (let i = 0; i < 6; i++) {
+        surface.rotate(ctx as never, dial({ mode }), i % 2 === 0 ? 1 : 2, false);
+        underWaySeen ||= isReplayMoveUnderWay();
+
+        expect(getReplayGateView("dial-1")).toEqual({ underWay: null, waiting: null });
+        await settle(30);
+      }
+
+      unsubscribe();
+
+      expect(notices.filter((notice) => notice.origin === "dial-1")).toEqual([]);
+      // Frame Jog's steps are under way while it turns, under no token.
+      expect(underWaySeen).toBe(mode === "frame-jog");
+    });
   });
 });
