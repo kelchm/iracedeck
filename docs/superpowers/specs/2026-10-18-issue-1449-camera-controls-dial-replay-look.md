@@ -15,13 +15,13 @@ Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dia
    | Mode | Label | Value | Neighbours | Caption | Side marks |
    | --- | --- | --- | --- | --- | --- |
    | Camera | `CAMERA` | the group's icon and name | the dimmed neighbouring groups of the enabled subset, one detent either way | none | both lit |
-   | Sub-camera | `SUB-CAMERA` | the camera name | the dimmed neighbouring cameras from the group's `Cameras[]`, a guide as today (#852) | none | both lit |
+   | Sub-camera | `SUB-CAMERA` | the camera name | the dimmed neighbouring cameras from the group's `Cameras[]`, a guide as today (#852) | none | none |
    | Car # | `CAR #` | `#12` | the car numbers one detent either way | none | both lit |
    | Position | `POSITION` | `P4` | the positions one detent either way | `#12` | lit where a detent that way has a car |
-   | Track Order | `TRACK ORDER` | `#12` | as #801: the cars ahead and behind, where the positions can be trusted | none | both lit |
-   | Driving Cam | `DRIVING CAM` | the group's icon and name | none, as today: iRacing resolves `group ± 1` itself | none | both lit |
+   | Track Order | `TRACK ORDER` | `#12` | as #801: the cars ahead and behind, where the positions can be trusted | none | none, as #801 draws it |
+   | Driving Cam | `DRIVING CAM` | the group's icon and name | none, as today: iRacing resolves `group ± 1` itself | none | none |
 
-   The labels are the strip's top line today. Position here keeps Camera Controls' order as it is (the canonical order, the official one as fallback); the replay dial's `P--` rule for a replay scrubbed back in a live session (#1448) is that dial's, and Camera Controls is not changed in what it does.
+   The labels are the strip's top line today. A label of ten letters or more takes no side marks: #801's review found `TRACK ORDER` colliding with the side-mark triangles on the Mirabox knob and touching them on the Stream Deck+, and #801 draws its Track Order with none (as Camera Controls' Track Order passes none, #1277), so `SUB-CAMERA` and `DRIVING CAM` take none too (amended 2026-10-18). Position here keeps Camera Controls' order as it is (the canonical order, the official one as fallback); the replay dial's `P--` rule for a replay scrubbed back in a live session (#1448) is that dial's, and Camera Controls is not changed in what it does.
 4. **The camera modes keep their group icons and their neighbour names** (maintainer, 2026-10-18, chosen over dropping them): the shared box gains the slots for them (below).
 5. **The per-mode accents stay** (`MODE_COLOR`) as the box's default accent per mode, and the user's colour overrides (`dialAppearanceFields`) apply as they do today.
 6. **Out of a session** each mode shows the box dimmed with its label, as the replay dial does, in place of today's plain identity label.
