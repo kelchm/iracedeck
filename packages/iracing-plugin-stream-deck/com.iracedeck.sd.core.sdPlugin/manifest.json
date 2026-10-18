@@ -1,7 +1,7 @@
 {
   "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
   "Name": "iRaceDeck",
-  "Version": "3.6.0.2409",
+  "Version": "3.6.0.2671",
   "Author": "Niklas Lampén",
   "Actions": [
     {
