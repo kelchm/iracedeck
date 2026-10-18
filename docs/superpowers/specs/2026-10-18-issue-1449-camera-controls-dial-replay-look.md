@@ -1,0 +1,57 @@
+# Camera Controls dial: the replay dial's look
+
+> **Issue:** [#1449](https://github.com/niklam/iracedeck/issues/1449) · **Supersedes:** _none_ · **Superseded by:** _none_
+>
+> Point-in-time design record. The code and `.claude/rules/` are the truth; this is not documentation.
+
+Camera Controls' dial draws its own carousel strips (`camera-controls/camera-dial-surface.ts`: `renderCameraCarousel`, `renderSubCameraCarousel`, `renderCarCarousel`, `renderRacePositionCarousel`, and `renderKnobCarousel` for the Mirabox knob). The Replay Control dial draws the shared dash box (`shared/dial-box.ts`) that most of the plugin's dials use: a label, a value, a caption, side marks, and, from #801, the neighbours beside the value. With #801 (`2026-10-12-issue-801-replay-control-dial-stepping.md`) and #1448 (`2026-10-18-issue-1448-replay-dial-camera-car-modes.md`), Track Order, Car # and Position exist on both dials, drawn two ways. The maintainer prefers the replay dial's look (2026-10-18: "This look is better than what Camera Controls has.") and chose to restyle Camera Controls' dial in an issue of its own, after #1448 (2026-10-18). It is built after both.
+
+## The decision
+
+1. **Every Camera Controls dial mode is drawn in the shared dash box**, through `renderDialBox`, which draws the Stream Deck+ strip and the Mirabox knob alike. The carousel renderers and their tests are deleted.
+2. **What a mode does is unchanged.** The targets, the sends, the number-primary rotation (a clockwise detent lowers the number in Car # and Position, #884 / #973), `reverseRotation`, the hold preview's outcomes (Focus My Car only, #1120), the #612 missing-binding warning on Sub-camera and Track Order, and the stored settings: no value is added, renamed or removed. So nothing in the settings changes, and no migration is needed.
+3. **The camera-car modes look exactly as on the replay dial**: Car # and Position as #1448 draws them, Track Order as #801 draws it, the neighbours beside the value included. One mode, one look, on either dial.
+
+   | Mode | Label | Value | Neighbours | Caption | Side marks |
+   | --- | --- | --- | --- | --- | --- |
+   | Camera | `CAMERA` | the group name | none | none | both lit |
+   | Sub-camera | `SUB-CAMERA` | the camera name | none | none | both lit |
+   | Car # | `CAR #` | `#12` | the car numbers one detent either way | none | both lit |
+   | Position | `POSITION` | `P4` | the positions one detent either way | `#12` | lit where a detent that way has a car |
+   | Track Order | `TRACK ORDER` | `#12` | as #801: the cars ahead and behind, where the positions can be trusted | none | both lit |
+   | Driving Cam | `DRIVING CAM` | the group name | none | none | both lit |
+
+   The labels are the strip's top line today. Position here keeps Camera Controls' order as it is (the canonical order, the official one as fallback); the replay dial's `P--` rule for a replay scrubbed back in a live session (#1448) is that dial's, and Camera Controls is not changed in what it does.
+4. **The camera modes lose their group icons and their neighbour names.** The box has a text value and no icon slot, and #801's neighbour slot is sized for a car number or a position, not a camera or group name. Camera and Driving Cam show the group name alone, and Sub-camera the camera name alone, with both side marks lit. This is the one thing the look takes away, and the open question below.
+5. **The per-mode accents stay** (`MODE_COLOR`) as the box's default accent per mode, and the user's colour overrides (`dialAppearanceFields`) apply as they do today.
+6. **Out of a session** each mode shows the box dimmed with its label, as the replay dial does, in place of today's plain identity label.
+
+## Open question
+
+**The camera modes' icons and neighbours.** The decision drops the group icons and the dimmed neighbour names for Camera, Sub-camera and Driving Cam. Should they go, as decided here, or should the shared box gain an icon slot and a wider neighbour slot for them? That would be a change to a renderer fourteen dials share.
+
+## Out of scope
+
+- **Any change to what a mode does**: its targets, sends, rotation mapping and settings.
+- **The replay dial's rules on Camera Controls' dial**: the `P--` rule for Position in a replay scrubbed back, and the wait for a jump under way before a camera switch (#1435 covers a camera key during a jump).
+- **The keypad**, and Camera Controls' Property Inspector beyond any help text that describes the strip.
+- **Ulanzi dials**, which are not declared.
+
+## Testing
+
+**Unit:**
+
+- Each mode's box: label, value, neighbours, caption and side marks, on the strip and on the knob; a long group or camera name fitted by the box; out of a session, the dimmed box.
+- The camera-car modes' boxes are the same as the replay dial's for the same camera car and field (one helper, or the same expectations in both suites).
+- The #612 warning drawn on Sub-camera and Track Order with a binding missing, and on no other mode.
+- The hold preview: Focus My Car's car number in the value slot with the pending bar, the side marks unchanged.
+- Every existing dispatch and rotation test passes unchanged: the behaviour did not move.
+- The per-mode accent and a user colour override reach the box.
+
+**Manual, on a Stream Deck+ and on the Mirabox knob:**
+
+1. Each of the six modes in a live session: the box shows what the table says, and a turn does what it did before.
+2. Car #, Position and Track Order side by side with a Replay Control dial in the same mode: the two boxes look the same.
+3. Hold the dial past the threshold with Focus My Car on Long Press: your car number shows with the pending bar, and the release focuses it.
+4. Sub-camera and Track Order with their iRacing binding unset: the warning shows.
+5. Out of a session: each mode's box is dimmed with its label.
