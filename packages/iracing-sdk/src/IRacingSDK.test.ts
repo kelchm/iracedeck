@@ -1,3 +1,4 @@
+import { silentLogger } from "@iracedeck/logger";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { INativeSDK } from "./interfaces.js";
@@ -185,6 +186,104 @@ describe("IRacingSDK", () => {
 
       // getHeader called once in connect, then once per getSessionInfo call
       expect(mockNative.getSessionInfoStr).toHaveBeenCalledTimes(1);
+    });
+
+    // The Euro NASCAR car's session info repeats `Tires:` under CarSetup (#1461),
+    // shaped as in a live dump: the first holds TireType, the second the corners
+    const DUPLICATE_KEY_YAML = [
+      "---",
+      "DriverInfo:",
+      " DriverCarIdx: 0",
+      " Drivers:",
+      " - CarIdx: 0",
+      '   CarNumber: "46"',
+      "CarSetup:",
+      " Tires:",
+      "  TireType:",
+      "   TireType: Dry",
+      " Tires:",
+      "  LeftFront:",
+      "   ColdPressure: 159 kPa",
+      "...",
+      "",
+    ].join("\n");
+
+    it("parses YAML that repeats a map key, keeping both sections", () => {
+      vi.mocked(mockNative.getVarHeaderEntry).mockReturnValue(null);
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValue(DUPLICATE_KEY_YAML);
+      sdk.connect();
+
+      const sessionInfo = sdk.getSessionInfo() as Record<string, any> | null;
+
+      expect(sessionInfo?.DriverInfo.Drivers[0].CarNumber).toBe("46");
+      expect(sessionInfo?.CarSetup.Tires.TireType.TireType).toBe("Dry");
+      expect(sessionInfo?.CarSetup.Tires.LeftFront.ColdPressure).toBe("159 kPa");
+    });
+
+    it("warns about a repeated key once per connection", () => {
+      const logger = { ...silentLogger, warn: vi.fn(), debug: vi.fn() };
+      sdk = new IRacingSDK(mockNative, logger);
+      vi.mocked(mockNative.getVarHeaderEntry).mockReturnValue(null);
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValue(DUPLICATE_KEY_YAML);
+      sdk.connect();
+      sdk.getSessionInfo();
+
+      const header = mockNative.getHeader();
+      vi.mocked(mockNative.getHeader).mockReturnValue({ ...header!, sessionInfoUpdate: 1 });
+      sdk.getSessionInfo();
+
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.debug).toHaveBeenCalledWith("Repeated session info keys: CarSetup.Tires");
+
+      sdk.disconnect();
+      sdk.connect();
+      sdk.getSessionInfo();
+
+      expect(logger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    it("parses a failed update once and logs it once, until the next update", () => {
+      const logger = { ...silentLogger, error: vi.fn() };
+      sdk = new IRacingSDK(mockNative, logger);
+      vi.mocked(mockNative.getVarHeaderEntry).mockReturnValue(null);
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValue("WeekendInfo: [unclosed");
+      sdk.connect();
+
+      expect(sdk.getSessionInfo()).toBe(null);
+      expect(sdk.getSessionInfo()).toBe(null);
+      expect(mockNative.getSessionInfoStr).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+
+      const header = mockNative.getHeader();
+      vi.mocked(mockNative.getHeader).mockReturnValue({ ...header!, sessionInfoUpdate: 1 });
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValue("WeekendInfo:\n  TrackName: Spa");
+
+      const sessionInfo = sdk.getSessionInfo();
+
+      expect((sessionInfo?.WeekendInfo as Record<string, unknown>)?.TrackName).toBe("Spa");
+      expect(mockNative.getSessionInfoStr).toHaveBeenCalledTimes(2);
+    });
+
+    it("drops the previous update's session info when the next update fails to parse", () => {
+      vi.mocked(mockNative.getVarHeaderEntry).mockReturnValue(null);
+      sdk.connect();
+      expect(sdk.getSessionInfo()).not.toBe(null);
+
+      const header = mockNative.getHeader();
+      vi.mocked(mockNative.getHeader).mockReturnValue({ ...header!, sessionInfoUpdate: 1 });
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValue("WeekendInfo: [unclosed");
+
+      expect(sdk.getSessionInfo()).toBe(null);
+    });
+
+    it("retries when the native SDK returned no YAML string", () => {
+      vi.mocked(mockNative.getVarHeaderEntry).mockReturnValue(null);
+      vi.mocked(mockNative.getSessionInfoStr).mockReturnValueOnce("");
+      sdk.connect();
+
+      expect(sdk.getSessionInfo()).toBe(null);
+      expect(sdk.getSessionInfo()).not.toBe(null);
+      expect(mockNative.getSessionInfoStr).toHaveBeenCalledTimes(2);
     });
   });
 
