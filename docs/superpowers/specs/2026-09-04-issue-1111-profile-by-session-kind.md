@@ -58,9 +58,11 @@ The rows stay visible and editable while the toggle is off, so the mapping can b
 
 ### 4. When it switches, and how it gets back
 
-Triggers: the first snapshot after connect (the sim may already be in a session), and `session.changed` (its payload carries only session numbers; the kind is read from the translator at that moment, the way the callout engine does). A switch is made only when the kind differs from the last one acted on, so a manual switch mid-session is never fought; the next session change applies the mapping again.
+Trigger: every SDK tick reads the current kind from the translator (`getSessionKind()`), so the sim already being in a session when the plugin connects is covered by the first tick. A switch is made only when the pair (kind, mapped profile) differs from the last pair acted on, so a manual switch mid-session is never fought; the next session kind applies the mapping again, and so does changing a row or turning the toggle on, which apply at once. Nothing is recorded while the toggle is off.
 
-On iRacing exit — the app monitor's terminate hook — the reactor returns each deck to the profile it was on before the **first** automatic switch, through the per-device history stack Back to previous already keeps (#762); with nothing to pop it falls back the way Back does. Exit is a no-op for a deck the reactor never switched.
+Amended 2026-10-20 during implementation: the first version named the first snapshot after connect and `session.changed` as the triggers. The translator publishes no `session.changed` for a saved-replay session and deliberately skips its connect-time synthesis late in a race, so neither covers the Replay row or a plugin started mid-race; reading the kind per tick does, and costs one settings read while the toggle is off.
+
+On iRacing exit — the app monitor's terminate hook — the reactor returns each deck it switched, by name, to the profile the per-device history stack (#762) showed it on before the **first** automatic switch (`getCurrentProfile`), or to the deck's bundled Default when that was unknown. A single Back pop would only undo the last switch. Exit is a no-op for a deck the reactor never switched or that has disconnected.
 
 Every connected profile-capable deck is switched. A deck with no variant of the mapped profile (the Mini, the Neo, the Galleon, and the Stream Deck + until #1457) is skipped and logged at debug. The mapping is plugin-wide, not per deck; per-deck tables are not worth their settings surface until someone asks.
 
