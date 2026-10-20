@@ -32,7 +32,7 @@ Three things to know:
 
 - **`scripts/vitest-native-mock.test.mjs` guards it.** The invariant rests on one config line whose removal produces *no* failing test — the symptom is an intermittently dropped worker, which reads as a flake rather than a regression. The guard asserts the runtime effect, so it survives the setting moving elsewhere.
 - **To use the real addon, set `IRACEDECK_REAL_NATIVE=1`.** The hook refuses `IRACEDECK_MOCK=0`, which would still mock — both consumers test `!!process.env.IRACEDECK_MOCK`, so any non-empty string forces it — and the same trap applies in `pnpm test:watch` while iterating on a native change.
-- **What it does not cover.** `config.env` reaches test *workers* only, never the main Vitest process, so a future `globalSetup` or Vite plugin could still load an addon. It also propagates to child processes, so anything a `scripts/**/*.test.mjs` shells out to inherits it. And the addon-loading branch in both packages now runs in no automated check at all — it was already skipped on Linux CI and is now skipped locally too.
+- **What it does not cover.** `config.env` reaches test *workers* only, never the main Vitest process, so a future `globalSetup` or Vite plugin could still load an addon. It also propagates to child processes, so anything a `scripts/**/*.test.mjs` shells out to inherits it. And the real `require()` of a `.node` runs in no automated check at all — it was already skipped on Linux CI and is now skipped locally too. The load *decision* around it is unit-tested with a fake loader since #1373 (`loadNativeAddon` in each package).
 
 Whether this removes the cause of #1084 is **unestablished**; it removes a path that could produce it.
 
