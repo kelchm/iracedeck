@@ -5,29 +5,35 @@ import {
   replaySpeedToSdk,
   type TelemetryData,
 } from "@iracedeck/iracing-sdk";
+import {
+  _resetCameraSwitchWaiter,
+  _resetReplaySpeedState,
+  cancelReplayCursorOwner,
+  claimReplayCursor,
+  currentReplayCursorOwner,
+  DIAL_SPEED_HOLD_MS,
+  FASTEST_LAP_WALK_OWNER,
+  getReplayGateRecord,
+  getReplayGateView,
+  isReplayMoveUnderWay,
+  lastListedSessionNum,
+  noteReplaySpeedSent,
+  noteTelemetrySpeed,
+  onReplaySpeedChanged,
+  pressReplayCommand,
+  RACE_START_WALK_OWNER,
+  type RecordStepSource,
+  rememberedSpeed,
+  REPLAY_TARGET_GIVE_UP_MS,
+  type ReplayGateNotice,
+  subscribeReplayGate,
+} from "@iracedeck/replay-engine";
 import type { ReplaySessionStore } from "@iracedeck/replay-store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { labelClearsSideMarks } from "../../shared/dial-label-fit.js";
 import { registerReplayBusySurface, type ReplayBusyLook } from "../../shared/replay-busy-indicator.js";
-import {
-  _configureReplayCommandGate,
-  _resetReplayCommandGate,
-  getReplayGateRecord,
-  getReplayGateView,
-  isReplayMoveUnderWay,
-  pressReplayCommand,
-  type ReplayGateNotice,
-  subscribeReplayGate,
-} from "../../shared/replay-command-gate.js";
-import {
-  _resetReplayCursor,
-  cancelReplayCursorOwner,
-  claimReplayCursor,
-  currentReplayCursorOwner,
-} from "../../shared/replay-cursor.js";
-import { _resetReplayPositionState, REPLAY_TARGET_GIVE_UP_MS } from "../../shared/replay-position-state.js";
-import { lastListedSessionNum } from "./green-flag-target.js";
+import { engineOverDeck } from "../../shared/replay-engine-deck.test-support.js";
 import type { ReplayDialModeIo, ReplaySpeed } from "./replay-control-dial-mode.js";
 import { REPLAY_DIAL_MODES, ReplayControlDialSettings } from "./replay-control-dial-settings.js";
 import {
@@ -45,14 +51,7 @@ import { incidentMode } from "./replay-control-incident-mode.js";
 import { lapMode } from "./replay-control-lap-mode.js";
 import { sessionMode } from "./replay-control-session-mode.js";
 import { speedMode } from "./replay-control-speed-mode.js";
-import { _resetTrackOrderTap, trackOrderMode } from "./replay-control-track-order-mode.js";
-import type { RecordStepSource } from "./replay-record-step.js";
-import {
-  _resetReplaySpeedState,
-  DIAL_SPEED_HOLD_MS,
-  noteTelemetrySpeed,
-  rememberedSpeed,
-} from "./replay-speed-state.js";
+import { trackOrderMode } from "./replay-control-track-order-mode.js";
 
 /**
  * The paced search (#801) is another module's, and its runner is not under
@@ -66,10 +65,10 @@ const queue = vi.hoisted(() => ({
   /** Called as a turn is queued, for a test that asks what stood when it went out. */
   onTurn: null as null | (() => void),
   listeners: new Set<() => void>(),
-  speedListeners: new Set<(speed: { speed: number; slowMotion: boolean }) => void>(),
 }));
 
-vi.mock("./replay-search-queue.js", () => ({
+vi.mock("@iracedeck/replay-engine", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@iracedeck/replay-engine")>()),
   queueReplaySearch: (turn: { target: string; ticks: number; origin: string; owner: string }) => {
     queue.onTurn?.();
     queue.turns.push(turn);
@@ -81,13 +80,6 @@ vi.mock("./replay-search-queue.js", () => ({
 
     return () => {
       queue.listeners.delete(listener);
-    };
-  },
-  onReplaySearchSpeedSent: (listener: (speed: { speed: number; slowMotion: boolean }) => void) => {
-    queue.speedListeners.add(listener);
-
-    return () => {
-      queue.speedListeners.delete(listener);
     };
   },
   _resetReplaySearchQueue: () => undefined,
@@ -123,6 +115,12 @@ vi.mock("@iracedeck/deck-iracing", () => ({
     },
   }),
 }));
+
+// The engine over this file's deck-iracing mocks (#1467). Every reset goes through
+// resetEngine, which resets each engine module and configures the engine again.
+const { configureEngine, resetEngine } = engineOverDeck();
+
+configureEngine();
 
 vi.mock("@iracedeck/deck-core", async () => {
   // deck-core's dial-gesture and icon-update-throttle modules, reached by PATH
@@ -233,10 +231,12 @@ function nowPlaying(s: ReplaySpeed): void {
 }
 
 const logger = { trace: vi.fn(), debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+
+/** Every speed the engine recorded as sent in the running test, in order (#1467). */
+const sentSpeeds: ReplaySpeed[] = [];
 const host = {
   /** The fresh read; a mock so a test can count the native reads an entry takes. */
   telemetry: vi.fn(() => env.telemetry),
-  setLocalSpeed: vi.fn((_speed: number, _slowMotion: boolean) => undefined),
   jumpToLive: vi.fn(() => undefined),
   jumpToRaceStart: vi.fn(() => undefined),
   canJumpToRaceStart: vi.fn(() => true),
@@ -264,7 +264,6 @@ const host = {
   })),
   tapBinding: vi.fn((_key: string) => Promise.resolve(true)),
   isBindingMissing: vi.fn((_keys: string | readonly string[]) => false),
-  cancelCameraWalks: vi.fn((_by: string) => undefined),
 };
 
 function makeSurface(): ReplayControlDialSurface {
@@ -272,7 +271,6 @@ function makeSurface(): ReplayControlDialSurface {
     logger: logger as never,
     inReplay: () => env.inReplay,
     telemetry: host.telemetry,
-    setLocalSpeed: host.setLocalSpeed,
     jumpToLive: host.jumpToLive,
     jumpToRaceStart: host.jumpToRaceStart,
     canJumpToRaceStart: host.canJumpToRaceStart,
@@ -284,7 +282,6 @@ function makeSurface(): ReplayControlDialSurface {
     recordSource: host.recordSource,
     tapBinding: host.tapBinding,
     isBindingMissing: host.isBindingMissing,
-    cancelCameraWalks: host.cancelCameraWalks,
   });
 }
 
@@ -380,12 +377,8 @@ describe("ReplayControlDialSurface", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
-    _resetReplayCursor();
-    _resetReplaySpeedState();
-    _resetReplayPositionState();
-    _resetReplayCommandGate();
     // The gate reads the same replay the surface does (#1430).
-    _configureReplayCommandGate({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
+    resetEngine({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
     env.inReplay = true;
     env.telemetry = replayAt(speed(1));
     env.sessionInfo = null;
@@ -395,7 +388,8 @@ describe("ReplayControlDialSurface", () => {
     queue.running = null;
     queue.onTurn = null;
     queue.listeners.clear();
-    queue.speedListeners.clear();
+    sentSpeeds.length = 0;
+    onReplaySpeedChanged((sent) => sentSpeeds.push(sent));
     host.isBindingMissing.mockReturnValue(false);
     host.tapBinding.mockResolvedValue(true);
     mocks.thresholdMs.value = 500;
@@ -464,13 +458,16 @@ describe("ReplayControlDialSurface", () => {
       expect(mocks.setPlaySpeed).toHaveBeenCalledWith(16, false);
     });
 
-    it("tells the action's own speed cache and redraws its keys after a send", async () => {
+    it("a dial send writes the resume speed through the gate", async () => {
       const { surface, ctx, d } = await onScreen(speed(1));
 
       surface.rotate(ctx as never, d, 1, false);
 
-      expect(host.setLocalSpeed).toHaveBeenCalledWith(2, false);
-      expect(host.refreshKeys).toHaveBeenCalledTimes(1);
+      // The gate recorded the send (#1467): the speed state's listeners heard it, and it is what Play resumes.
+      expect(sentSpeeds).toEqual([speed(2)]);
+      expect(rememberedSpeed()).toEqual(speed(2));
+      // The keys redraw from the action's own subscription, not through the host.
+      expect(host.refreshKeys).not.toHaveBeenCalled();
     });
 
     it("a send iRacing did not take leaves no pending speed and tells nobody", async () => {
@@ -485,7 +482,7 @@ describe("ReplayControlDialSurface", () => {
         [2, false],
         [2, false],
       ]);
-      expect(host.setLocalSpeed).not.toHaveBeenCalled();
+      expect(sentSpeeds).toEqual([]);
       expect(rememberedSpeed()).toEqual(speed(1));
     });
   });
@@ -818,7 +815,7 @@ describe("ReplayControlDialSurface", () => {
       expect(vi.getTimerCount()).toBe(0);
     });
 
-    it("sends nothing at the lapse: it redraws, and resyncs the action's speed cache", async () => {
+    it("sends nothing at the lapse: it redraws the dial and the keys", async () => {
       const { surface, ctx, d } = await onScreen(PAUSED);
       surface.rotate(ctx as never, d, 1, false);
       await settle();
@@ -828,54 +825,46 @@ describe("ReplayControlDialSurface", () => {
 
       expectNothingSent();
       expect(ctx.setDialCanvas).toHaveBeenCalledTimes(1);
-      expect(host.setLocalSpeed).toHaveBeenCalledTimes(1);
       expect(host.refreshKeys).toHaveBeenCalledTimes(1);
     });
 
-    it("takes the ignored speed back out of the action's cache, so a Play/Pause key reads the replay as paused", async () => {
+    it("redraws the keys when the ignored speed lapses, so a Play/Pause key reads the replay as paused", async () => {
       const { surface, ctx, d } = await onScreen(PAUSED);
 
       surface.rotate(ctx as never, d, 1, false);
-      // The send put its speed in the cache at once, for the keys.
-      expect(host.setLocalSpeed.mock.calls).toEqual([[4, true]]);
-      expect(host.refreshKeys).toHaveBeenCalledTimes(1);
+      // The send is the shown speed at once, for the keys too (#1467).
+      expect(sentSpeeds).toEqual([speed(4, true)]);
+      expect(surface["io"].liveSpeed()).toEqual(speed(4, true));
 
       // No tick follows: the replay never left 0x.
       await vi.advanceTimersByTimeAsync(PAST_THE_LAPSE);
 
-      expect(host.setLocalSpeed.mock.calls).toEqual([
-        [4, true],
-        [0, false],
-      ]);
-      expect(host.refreshKeys).toHaveBeenCalledTimes(2);
-      // The cache was written before the keys were asked to redraw from it.
-      expect(host.setLocalSpeed.mock.invocationCallOrder[1]).toBeLessThan(host.refreshKeys.mock.invocationCallOrder[1]);
+      expect(host.refreshKeys).toHaveBeenCalledTimes(1);
+      expect(surface["io"].liveSpeed()).toEqual(PAUSED);
     });
 
-    it("writes the same speed back when the send took, so nothing changes for the keys", async () => {
+    it("reads the same speed back when the send took, so nothing changes for the keys", async () => {
       const { surface, ctx, d } = await onScreen(PAUSED);
       surface.rotate(ctx as never, d, 1, false);
       nowPlaying(speed(4, true));
 
       await vi.advanceTimersByTimeAsync(PAST_THE_LAPSE);
 
-      expect(host.setLocalSpeed.mock.calls).toEqual([
-        [4, true],
-        [4, true],
-      ]);
+      expect(surface["io"].liveSpeed()).toEqual(speed(4, true));
+      expect(rememberedSpeed()).toEqual(speed(4, true));
     });
 
     it("resyncs from what a fresh read says at the lapse, whatever the last tick said", async () => {
       const { surface, ctx, d } = await onScreen(speed(1));
       surface.onTick(ctx.id, tickOf());
       await press(surface, ctx, d);
-      expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
+      expect(surface["io"].liveSpeed()).toEqual(PAUSED);
 
       // iRacing's own bar resumes at 2x inside the hold, on a frame that delivers no tick.
       nowPlaying(speed(2));
       await vi.advanceTimersByTimeAsync(PAST_THE_LAPSE);
 
-      expect(host.setLocalSpeed).toHaveBeenLastCalledWith(2, false);
+      expect(surface["io"].liveSpeed()).toEqual(speed(2));
       expect(shownValue(lastBox(ctx))).toBe("2x");
     });
 
@@ -915,7 +904,7 @@ describe("ReplayControlDialSurface", () => {
       expect(shownValue(lastBox(back))).toBe("PAUSED");
     });
 
-    it("with no dial on screen at the lapse it draws nothing, and still resyncs the action's speed cache", async () => {
+    it("with no dial on screen at the lapse it draws nothing, and still redraws the keys", async () => {
       const { surface, ctx, d } = await onScreen(PAUSED);
       surface.rotate(ctx as never, d, 1, false);
       await settle();
@@ -925,7 +914,6 @@ describe("ReplayControlDialSurface", () => {
       await vi.advanceTimersByTimeAsync(PAST_THE_LAPSE);
 
       expect(ctx.setDialCanvas).not.toHaveBeenCalled();
-      expect(host.setLocalSpeed.mock.calls).toEqual([[0, false]]);
       expect(host.refreshKeys).toHaveBeenCalledTimes(1);
       expectNothingSent();
       expect(vi.getTimerCount()).toBe(0);
@@ -978,8 +966,7 @@ describe("ReplayControlDialSurface", () => {
       surface.onTick(ctx.id, tickOf());
       await vi.advanceTimersByTimeAsync(DIAL_SPEED_HOLD_MS - 1);
       expect(io.liveSpeed()).toEqual(PAUSED);
-      expect(host.setLocalSpeed).toHaveBeenCalledWith(0, false);
-      expect(host.refreshKeys).toHaveBeenCalled();
+      expect(sentSpeeds).toEqual([PAUSED]);
     });
 
     it("pause leaves the remembered speed alone, so Press resumes what was playing", async () => {
@@ -1018,7 +1005,7 @@ describe("ReplayControlDialSurface", () => {
       expect(io.pause("dial-frame-jog")).toBe(false);
 
       expect(io.liveSpeed()).toEqual(speed(4));
-      expect(host.setLocalSpeed).not.toHaveBeenCalled();
+      expect(sentSpeeds).toEqual([]);
     });
 
     it("setSpeed remembers a non-zero target as the resume speed, and never a 0", async () => {
@@ -2023,7 +2010,7 @@ describe("ReplayControlDialSurface", () => {
       surface.touchTap(ctx as never, d, true);
 
       expectNothingSent();
-      expect(host.setLocalSpeed).not.toHaveBeenCalled();
+      expect(sentSpeeds).toEqual([]);
     });
 
     it("Reverse does not flip the remembered speed from the car", async () => {
@@ -2993,7 +2980,7 @@ describe("ReplayControlDialSurface", () => {
 
     beforeEach(() => {
       store.value = null;
-      _resetTrackOrderTap();
+      _resetCameraSwitchWaiter();
     });
 
     describe("Lap and Session: one waited jump per turn", () => {
@@ -3099,7 +3086,7 @@ describe("ReplayControlDialSurface", () => {
         expect(host.tapBinding).not.toHaveBeenCalled();
       });
 
-      it("a record jump's landing is mirrored to the keys and the box redrawn when the turn settles", async () => {
+      it("a record jump from a paused replay sends no speed, reads paused, and the box is redrawn when the turn settles", async () => {
         withRecord();
         const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000));
 
@@ -3110,8 +3097,26 @@ describe("ReplayControlDialSurface", () => {
         expect(currentReplayCursorOwner()).toBeNull();
         expect(logger.error).not.toHaveBeenCalled();
         expect(logger.warn).not.toHaveBeenCalled();
-        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
+        // Nothing needed pausing and Replay jump playback kept the replay paused: no speed went out (#1467).
+        expect(sentSpeeds).toEqual([]);
+        expect(surface["io"].liveSpeed()).toEqual(PAUSED);
         expect(shownValue(lastBox(ctx))).toBe("3/8");
+      });
+
+      it("a record jump's pause and the speed it lands at are the dial's resume speed (#1467)", async () => {
+        withRecord();
+        const { surface, ctx, d } = await dialIn("lap", pausedOn(54_000, { ReplayPlaySpeed: 4 }));
+
+        surface.rotate(ctx as never, d, 1, false);
+        // iRacing reports the pause, then the landing.
+        env.telemetry = pausedOn(54_000);
+        await vi.advanceTimersByTimeAsync(50);
+        env.telemetry = pausedOn(56_000 - 60);
+        await vi.advanceTimersByTimeAsync(300);
+
+        expect(mocks.setPlaySpeed.mock.calls).toEqual([[0], [4, false]]);
+        expect(sentSpeeds).toEqual([PAUSED, speed(4)]);
+        expect(rememberedSpeed()).toEqual(speed(4));
       });
     });
 
@@ -3176,13 +3181,15 @@ describe("ReplayControlDialSurface", () => {
     describe("Car", () => {
       it("taps at once on a quiet replay, one tap per event, the right binding each way", async () => {
         const { surface, ctx, d } = await dialIn("track-order", pausedOn(54_000));
+        // A Jump to Fastest Lap walk holding the cursor: the camera switch stops it.
+        const walk = claimReplayCursor(FASTEST_LAP_WALK_OWNER);
 
         surface.rotate(ctx as never, d, 3, false);
         surface.rotate(ctx as never, d, -1, false);
         await settle();
 
         expect(host.tapBinding.mock.calls).toEqual([["replayControlNextCar"], ["replayControlPrevCar"]]);
-        expect(host.cancelCameraWalks).toHaveBeenCalledWith("dial-track-order");
+        expect(walk.cancelledBy).toBe("dial-track-order");
       });
 
       it("taps at once behind a search: a search does not swallow a camera change", async () => {
@@ -3237,11 +3244,19 @@ describe("ReplayControlDialSurface", () => {
         await press(surface, ctx, d, 500);
         await settle(0);
 
-        expect(host.cancelCameraWalks).toHaveBeenCalledWith("dial-jump-to-my-car");
         expect(host.jumpToMyCar).toHaveBeenCalledOnce();
         expect(run.cancelledBy).toBeNull();
         expect(currentReplayCursorOwner()).toBe("dial-lap");
         run.release();
+
+        // A Jump to Race Start walk is one of the two: the gesture stops it, under its own name.
+        const walk = claimReplayCursor(RACE_START_WALK_OWNER);
+
+        await press(surface, ctx, d, 500);
+        await settle(0);
+
+        expect(walk.cancelledBy).toBe("dial-jump-to-my-car");
+        expect(host.jumpToMyCar).toHaveBeenCalledTimes(2);
       });
 
       it("a Long Press during a position jump switches to my car once the jump has landed", async () => {
@@ -3438,73 +3453,56 @@ describe("ReplayControlDialSurface", () => {
         expect(shownCaption(lastBox(ctx))).toBe("");
       });
 
-      it("subscribes to the search's count while a dial is on screen and lets go when the last one leaves, but to its speeds for the surface's life", async () => {
+      it("subscribes to the search's count while a dial is on screen and lets go when the last one leaves", async () => {
         const surface = makeSurface();
         expect(queue.listeners.size).toBe(0);
-        expect(queue.speedListeners.size).toBe(1);
 
         const a = dialContext("a");
         const b = dialContext("b");
         await appear(surface, a, dial({ mode: "lap" }));
         await appear(surface, b, dial({ mode: "incident" }));
         expect(queue.listeners.size).toBe(1);
-        expect(queue.speedListeners.size).toBe(1);
 
         surface.willDisappear("a");
         expect(queue.listeners.size).toBe(1);
-        expect(queue.speedListeners.size).toBe(1);
         surface.willDisappear("b");
         expect(queue.listeners.size).toBe(0);
-        expect(queue.speedListeners.size).toBe(1);
       });
 
-      it("mirrors the runner's pause and playback speed into the keys with no dial on screen, as after a page flip mid-run", async () => {
+      it("draws nothing for the runner's speeds with no dial on screen, as after a page flip mid-run", async () => {
         const playing = { ...pausedOn(54_000), ...replayAt({ speed: 1, slowMotion: false }) } as TelemetryData;
         const { surface, ctx } = await dialIn("incident", playing);
 
         // The page flips away while the run the turn started goes on.
         surface.willDisappear(ctx.id);
-        host.setLocalSpeed.mockClear();
-        host.refreshKeys.mockClear();
         ctx.setDialCanvas.mockClear();
 
-        for (const listener of queue.speedListeners) listener({ speed: 0, slowMotion: false });
-
+        // The runner's pause and playback step, as the gate records them (#1467).
+        noteReplaySpeedSent(PAUSED, Date.now(), { rememberSpeed: true });
         await settle();
-        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
-        expect(host.refreshKeys).toHaveBeenCalledTimes(1);
-
-        for (const listener of queue.speedListeners) listener({ speed: 2, slowMotion: false });
-
+        noteReplaySpeedSent(speed(2), Date.now(), { rememberSpeed: true });
         await settle();
-        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(2, false);
-        expect(host.refreshKeys).toHaveBeenCalledTimes(2);
-        // Nothing is drawn on a dial that has left.
+
+        // Nothing is drawn on a dial that has left; the keys redraw from the action's own subscription.
         expect(ctx.setDialCanvas).not.toHaveBeenCalled();
       });
 
-      it("mirrors every speed the search's runner sends into a dial's caption and the keys, as a record jump's", async () => {
+      it("draws every speed the search's runner sends into a dial's caption, as a record jump's", async () => {
         const playing = { ...pausedOn(54_000), ...replayAt({ speed: 1, slowMotion: false }) } as TelemetryData;
         // Frame Jog's caption is the play state.
         const { ctx } = await dialIn("frame-jog", playing);
         expect(shownCaption(lastBox(ctx))).toBe("1x");
 
         // The runner paused the replay for its search: no tick follows yet.
-        for (const listener of queue.speedListeners) listener({ speed: 0, slowMotion: false });
+        noteReplaySpeedSent(PAUSED, Date.now(), { rememberSpeed: true });
 
         await settle();
-        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(0, false);
-        expect(host.refreshKeys).toHaveBeenCalled();
         expect(shownCaption(lastBox(ctx))).toBe("PAUSED");
 
         // The run ended at zero and its playback step played the replay on at 2x.
-        host.refreshKeys.mockClear();
-
-        for (const listener of queue.speedListeners) listener({ speed: 2, slowMotion: false });
+        noteReplaySpeedSent(speed(2), Date.now(), { rememberSpeed: true });
 
         await settle();
-        expect(host.setLocalSpeed).toHaveBeenLastCalledWith(2, false);
-        expect(host.refreshKeys).toHaveBeenCalled();
         expect(shownCaption(lastBox(ctx))).toBe("2x");
       });
 
@@ -3736,11 +3734,7 @@ describe("ReplayControlDialSurface — the busy look (#1437)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
-    _resetReplayCursor();
-    _resetReplaySpeedState();
-    _resetReplayPositionState();
-    _resetReplayCommandGate();
-    _configureReplayCommandGate({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
+    resetEngine({ readTelemetry: () => env.telemetry, inReplay: () => env.inReplay });
     env.inReplay = true;
     env.telemetry = replayAt(speed(1));
     mocks.thresholdMs.value = 500;

@@ -15,28 +15,28 @@
  */
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
 import type { ILogger } from "@iracedeck/logger";
+import {
+  type RecordStepResult,
+  type RecordStepSource,
+  type RecordStepSpec,
+  type ReplayPosition,
+  type ReplaySearchTarget,
+  type ReplaySettledOutcome,
+  type ReplaySpeed,
+} from "@iracedeck/replay-engine";
 
 import type { DialNeighbours, DialSideMarks } from "../../shared/dial-box.js";
-import type { ReplaySettledOutcome } from "../../shared/replay-command-gate.js";
-import type { ReplayPosition } from "../../shared/replay-position-state.js";
 import type { ReplayControlDialSettings } from "./replay-control-dial-settings.js";
-import type { RecordStepResult, RecordStepSource, RecordStepSpec } from "./replay-record-step.js";
-import type { ReplaySearchTarget } from "./replay-search-queue.js";
 
 /**
- * A replay speed in the shape `setPlaySpeed(speed, slowMotion)` takes and
- * `replaySpeedFromTelemetry` returns: in slow motion `speed` is the signed
- * divisor (−¼x is `{ speed: -4, slowMotion: true }`), and paused is
- * `{ speed: 0, slowMotion: false }`.
+ * A replay speed in the shape `setPlaySpeed(speed, slowMotion)` takes: the
+ * engine's type, re-exported here (#1467).
  */
-export interface ReplaySpeed {
-  speed: number;
-  slowMotion: boolean;
-}
+export type { ReplaySpeed };
 
 /**
  * What the surface hands a mode. Every command goes out through these helpers,
- * which press it through the replay command gate (`shared/replay-command-gate.ts`,
+ * which press it through the replay command gate (`replay-engine`'s `replay-command-gate.ts`,
  * #1430): the gate takes the replay cursor from an in-flight replay jump, and
  * decides whether the command goes out now, waits for a jump or a search
  * under way to land, or is not sent at all — a mode never calls
@@ -45,7 +45,7 @@ export interface ReplaySpeed {
  *
  * A mode that moves the replay by frames uses {@link position}, {@link step}
  * and {@link jumpTo}: the three share the plugin's one pending target
- * (`shared/replay-position-state.ts`), which is what keeps a move from being
+ * (`replay-engine`'s `replay-position-state.ts`), which is what keeps a move from being
  * measured from a frame the replay has already left, and a frame step from
  * being sent into a jump still under way.
  */
@@ -108,7 +108,7 @@ export interface ReplayDialModeIo {
 export interface ReplayDialStepIo extends ReplayDialModeIo {
   /**
    * One waited jump to `frame` through the shared jump sequence
-   * (`shared/replay-jump-playback.ts`, #1276), carrying the turning dial's
+   * (`replay-engine`'s `replay-jump-playback.ts`, #1276), carrying the turning dial's
    * origin token: the replay cursor is claimed and the frame recorded as the
    * pending target at the call, before the pause a moving replay is sent, so
    * a turn made while it runs steps on from where it is headed and its own
@@ -147,16 +147,10 @@ export interface ReplayDialStepIo extends ReplayDialModeIo {
   /** Whether any of the given global binding keys is unset (#612). */
   isBindingMissing(keys: string | readonly string[]): boolean;
   /**
-   * Cancels a Jump to Fastest Lap or Jump to Race Start walk that holds the
-   * replay cursor — the two whose searches ride on the camera's car — and no
-   * other owner, naming `by`.
-   */
-  cancelCameraWalks(by: string): void;
-  /**
    * Switches the camera to the player's car: the keypad's Jump to My Car
-   * switch, with no cursor taken, since the dial's gesture has cancelled only
-   * the two walks itself (`cancelCameraWalks`). With no player's car, or no
-   * number for it, it logs why and sends nothing.
+   * switch, with no cursor taken, since the engine's camera-switch waiter the
+   * dial's gesture goes through has cancelled only the two walks (#1467). With
+   * no player's car, or no number for it, it logs why and sends nothing.
    */
   jumpToMyCar(): void;
   /** Whether a position jump is under way: a pending target standing, or a seek showing. A search is not one. */

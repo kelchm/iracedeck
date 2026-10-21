@@ -1,23 +1,21 @@
 import { getCommands } from "@iracedeck/deck-iracing";
 import { ReplayPosMode, replaySpeedToSdk, type TelemetryData } from "@iracedeck/iracing-sdk";
-import { type ReplayMarker, type ReplaySessionStore } from "@iracedeck/replay-store";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-import {
-  _configureReplayCommandGate,
-  _resetReplayCommandGate,
-  pressReplayCommand,
-} from "../../shared/replay-command-gate.js";
 import {
   _resetReplayCursor,
   cancelReplayCursorOwner,
   claimReplayCursor,
   currentReplayCursorOwner,
+  describeReplayJump,
   pendingReplayJumpSpeed,
-} from "../../shared/replay-cursor.js";
-import { describeReplayJump, type ReplayJumpOutcome } from "../../shared/replay-jump-playback.js";
-import { _resetReplayPositionState, pendingReplayTarget } from "../../shared/replay-position-state.js";
-import { steppedReplayState, type SteppedReplayState } from "../../shared/test-support/replay-state.js";
+  pendingReplayTarget,
+  pressReplayCommand,
+  type ReplayJumpOutcome,
+} from "@iracedeck/replay-engine";
+import { steppedReplayState, type SteppedReplayState } from "@iracedeck/replay-engine/testing";
+import { type ReplayMarker, type ReplaySessionStore } from "@iracedeck/replay-store";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { engineOverDeck } from "../../shared/replay-engine-deck.test-support.js";
 import {
   followMarkerJump,
   jumpToMarkerFrame,
@@ -50,6 +48,12 @@ vi.mock("@iracedeck/replay-store", () => ({
   MARKER_NEXT_MIN_AHEAD_FRAMES: 60,
   MARKER_PREVIOUS_MIN_BEHIND_FRAMES: 120,
 }));
+
+// The engine over this file's deck-iracing mocks (#1467). Every reset goes through
+// resetEngine, which resets each engine module and configures the engine again.
+const { configureEngine, resetEngine } = engineOverDeck();
+
+configureEngine();
 
 function markers(...frames: number[]): ReplayMarker[] {
   return frames.map((frame) => ({ frame, sessionNum: 0, sessionTimeMs: 0 }));
@@ -331,7 +335,7 @@ function fakeSim(speed: SimSpeed, options: { lagMs?: number; seekLagMs?: number 
   };
 
   vi.mocked(getCommands).mockReturnValue({ replay } as never);
-  _configureReplayCommandGate({ readTelemetry: () => telemetry, inReplay: () => true });
+  configureEngine({ readTelemetry: () => telemetry, inReplay: () => true });
 
   return {
     replay,
@@ -353,9 +357,7 @@ async function settled(jump: Promise<ReplayJumpOutcome>, ms = 5_000): Promise<Re
 }
 
 function resetJumpState(): void {
-  _resetReplayCursor();
-  _resetReplayCommandGate();
-  _resetReplayPositionState();
+  resetEngine();
   vi.useFakeTimers({ now: PRESS_AT });
   mockGetGlobalSettings.mockReset().mockReturnValue({});
   vi.mocked(getCommands).mockReset();
@@ -365,7 +367,7 @@ describe("the replay's pending target is the anchor (#1230, #1430)", () => {
   beforeEach(resetJumpState);
 
   afterEach(() => {
-    _resetReplayCommandGate();
+    resetEngine();
     vi.useRealTimers();
   });
 
@@ -452,7 +454,7 @@ describe("jumpToMarkerFrame runs the shared jump sequence (#1276)", () => {
   beforeEach(resetJumpState);
 
   afterEach(() => {
-    _resetReplayCommandGate();
+    resetEngine();
     vi.useRealTimers();
   });
 

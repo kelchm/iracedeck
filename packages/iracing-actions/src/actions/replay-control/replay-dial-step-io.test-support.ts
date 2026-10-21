@@ -5,13 +5,16 @@
  * only by tests; nothing in the plugin bundle reaches it.
  */
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
+import {
+  type RecordStepResult,
+  type RecordStepSource,
+  type ReplayPosition,
+  type ReplaySettledOutcome,
+} from "@iracedeck/replay-engine";
 import type { LapStartListEntry, ReplaySessionStart, ReplaySessionStore } from "@iracedeck/replay-store";
 import { type Mock, vi } from "vitest";
 
-import type { ReplaySettledOutcome } from "../../shared/replay-command-gate.js";
-import type { ReplayPosition } from "../../shared/replay-position-state.js";
 import type { ReplayDialStepIo, ReplaySpeed } from "./replay-control-dial-mode.js";
-import type { RecordStepResult, RecordStepSource } from "./replay-record-step.js";
 
 /** A source over a recorded lap list for car 4 (car number 104) and a session list. */
 export function recordSource(
@@ -76,7 +79,6 @@ export function fakeStepIo(): FakeStepIo {
     pendingSearch: vi.fn((): number | null => null),
     tapBinding: vi.fn((_key: string) => Promise.resolve(true)),
     isBindingMissing: vi.fn((_keys: string | readonly string[]) => false),
-    cancelCameraWalks: vi.fn(),
     jumpToMyCar: vi.fn(),
     isJumpUnderWay: vi.fn(() => false),
     waitForJumpsToSettle: vi.fn((): Promise<ReplaySettledOutcome> => Promise.resolve("settled")),

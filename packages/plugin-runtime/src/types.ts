@@ -69,7 +69,7 @@ export interface Core {
   readonly nativeAddons: NativeAddonStatuses;
 }
 
-/** Phase 3's handoff: the native input layer, used again by window focus (phase 8) and the elevation check (phase 9). */
+/** Phase 3's handoff: the native input layer, used again by window focus (phase 9) and the elevation check (phase 10). */
 export interface Input {
   readonly native: IRacingNative;
 }
@@ -131,6 +131,10 @@ export interface VoicePacks {
 /** Phase 7's handoff. */
 export interface Settings {
   readonly store: SettingsStore;
-  readonly replayStore: ReplaySessionStore;
   openSettingsWindow(options?: SettingsWindowOpenOptions): ReturnType<SettingsWindowController["open"]>;
+}
+
+/** Phase 8's handoff (#1467): the per-session replay store, fed by the bus and read by the replay subscriber. */
+export interface Replay {
+  readonly replayStore: ReplaySessionStore;
 }

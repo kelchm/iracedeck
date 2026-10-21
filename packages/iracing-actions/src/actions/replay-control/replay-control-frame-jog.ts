@@ -5,7 +5,7 @@
  * gestures and every push to the screen. Design:
  * `docs/superpowers/specs/2026-10-04-issue-1316-replay-control-dial.md`.
  *
- * What a turn sends is the shared frame-move rule (`shared/replay-frame-move.ts`,
+ * What a turn sends is the shared frame-move rule (`replay-engine`'s `replay-frame-move.ts`,
  * moved there in #1430 so a Frame Forward key and its repeat follow it too):
  * a single detent on a replay at rest is a frame step, and everything else —
  * several detents in one event, or any turn while the last move of any surface
@@ -15,11 +15,9 @@
  * paused there.
  */
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
+import { formatSpeedDisplay, type FrameMove, planFrameMove, type ReplayPosition } from "@iracedeck/replay-engine";
 
-import { type FrameMove, planFrameMove } from "../../shared/replay-frame-move.js";
-import type { ReplayPosition } from "../../shared/replay-position-state.js";
 import type { ReplayDialMode } from "./replay-control-dial-mode.js";
-import { formatSpeedDisplay } from "./replay-speed-format.js";
 
 /** The replay-cursor owner every Frame Jog command is sent under. */
 const CURSOR_OWNER = "dial-frame-jog";

@@ -1,17 +1,9 @@
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
+import { pressReplayCommand } from "@iracedeck/replay-engine";
+import { cursorTestEvent, type ReplayCursorProbe, stageReplayCursorProbe } from "@iracedeck/replay-engine/testing";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  _configureReplayCommandGate,
-  _resetReplayCommandGate,
-  pressReplayCommand,
-} from "../../shared/replay-command-gate.js";
-import {
-  cursorTestEvent,
-  type ReplayCursorProbe,
-  stageReplayCursorProbe,
-} from "../../shared/replay-cursor.test-support.js";
-import { _resetReplayPositionState } from "../../shared/replay-position-state.js";
+import { engineOverDeck } from "../../shared/replay-engine-deck.test-support.js";
 import { generateReplaySpeedSvg, ReplaySpeed, ReplaySpeedSettings } from "./replay-speed.js";
 
 vi.mock("@iracedeck/icons/replay-speed/increase.svg", () => ({
@@ -90,6 +82,12 @@ vi.mock("@iracedeck/settings", () => ({
   getGlobalColors: vi.fn(() => ({})),
 }));
 
+// The engine over this file's deck-iracing mocks (#1467). Every reset goes through
+// resetEngine, which resets each engine module and configures the engine again.
+const { configureEngine, resetEngine } = engineOverDeck();
+
+configureEngine();
+
 const REPLAY_READING = {
   IsReplayPlaying: true,
   ReplayFrameNum: 2000,
@@ -102,8 +100,7 @@ const REPLAY_READING = {
 describe("ReplaySpeed", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    _resetReplayCommandGate();
-    _resetReplayPositionState();
+    resetEngine();
   });
 
   describe("generateReplaySpeedSvg", () => {
@@ -197,7 +194,7 @@ describe("ReplaySpeed", () => {
       };
       const { getCommands } = await import("@iracedeck/deck-iracing");
       vi.mocked(getCommands).mockReturnValue({ replay } as any);
-      _configureReplayCommandGate({ readTelemetry: () => REPLAY_READING, inReplay: () => true });
+      configureEngine({ readTelemetry: () => REPLAY_READING, inReplay: () => true });
 
       pressReplayCommand({ kind: "jump", frame: 160000 }, { by: "marker" });
       await new ReplaySpeed().onDialDown(cursorTestEvent({}) as any);

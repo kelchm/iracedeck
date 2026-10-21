@@ -24,13 +24,18 @@
  * from 0 again, and the first instance's laps are not the second's. The laps
  * in the session are `replay-lap-count.ts`'s.
  */
+import {
+  formatLapOfLaps,
+  listRecord,
+  NO_CAR_IDX,
+  type RecordListing,
+  type ReplayPosition,
+  sessionLapCount,
+} from "@iracedeck/replay-engine";
 import type { LapStartListEntry, ReplaySessionStart } from "@iracedeck/replay-store";
 
-import type { ReplayPosition } from "../../shared/replay-position-state.js";
 import { carArraysTrusted } from "./replay-car-arrays.js";
 import type { ReplayDialStepIo } from "./replay-control-dial-mode.js";
-import { formatLapOfLaps, sessionLapCount } from "./replay-lap-count.js";
-import { listRecord, NO_CAR_IDX, type RecordListing } from "./replay-record-step.js";
 
 /**
  * @internal Exported for testing
