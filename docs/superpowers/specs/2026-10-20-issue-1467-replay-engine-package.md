@@ -85,7 +85,7 @@ The engine subscribes to the controller and detects the edge of `getReplayState(
 
 **The edge is held through the plugin's own seek** (added 2026-10-21, once Task 7 read the code). In a live session the debounced state gives the replay up about a second into any long seek the plugin makes itself (the search queue's `replayOnScreen()`, and the #801 spec's in-replay guard). A walk's first probe on a long tape is such a seek, so the bare edge would cancel the walk that made it, which would be a fifth behaviour change. So while the debounced state reads false and a move of the plugin's own still stands, `left` is not emitted yet:
 
-- a gate position target that has not read back holds it for that target's own wait (`replayTargetGiveUpMs`, the larger of `REPLAY_TARGET_GIVE_UP_MS` and twice the jump's length at iRacing's search rate), counted from the edge;
+- a gate position target that has not read back holds it for that target's own wait (`replayTargetGiveUpMs`, the larger of `REPLAY_TARGET_GIVE_UP_MS` and twice the jump's length at iRacing's search rate), counted from the edge, or from the target's send when it went out after the edge, so a walk's next probe gets its whole wait;
 - a seek that shows without a target holds it for `REPLAY_TARGET_GIVE_UP_MS`.
 
 `left` is emitted when the state still reads false once nothing holds it. If the state reads true again first, nothing is emitted. The hold is bounded on purpose, for the reason #801 gives: an unbounded hold would never let the event fire during a walk, because the walk always holds a target. The cost is that behaviour change 4 can land up to one jump's wait after the replay is really left, never before. A disconnect is not held.
