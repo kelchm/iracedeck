@@ -8,11 +8,11 @@ The Starter key shows whether the engine is running (#561): the red START badge 
 
 ## Behaviour
 
-- **A new setting on the Starter key: Flash while starting**, a checkbox shown only when the Mode is Starter, on keys and on dials. **Off by default**: the requester asked for an option, and a key that starts blinking after an update changes a look people already know.
+- **A new setting on the Starter key: Flash while starting**, a checkbox shown only when the Mode is Starter. Car Control is a keypad action in all three manifests, so this is a key setting. **Off by default**: the requester asked for an option, and a key that starts blinking after an update changes a look people already know.
 - **A press starts the flash** when the setting is on and the engine is not already confirmed running. The badge alternates between its dimmed and full-strength look every **250 ms**, Session Info's flash rhythm (`FLASH_INTERVAL_MS`), for at most **3 seconds** from the press. The status bar and border keep showing the real state from telemetry throughout, so the flash never claims the engine is running.
 - **It stops early when the engine is running.** The first time `starterToggleState` reads `on`, the flash ends and the key shows the normal green ON look.
 - **If the engine has not started after 3 seconds**, the flash ends and the key shows whatever telemetry says, normally the dimmed OFF look.
-- **A press while the flash runs restarts the 3 seconds.** A press while the engine is already running starts no flash.
+- **A press while the flash runs restarts the 3 seconds.** A press while the engine is already running starts no flash, and neither does one with no Starter binding set: that press sent nothing, so the key must not claim to be cranking. The press must itself be a Starter press as well as the stored Mode, so a Mode change landing during another control's send does not flash.
 - **It is display only.** The press-and-hold behaviour is unchanged: the binding is held on press and released on release exactly as today, and the flash is started after the hold is sent, so it never delays the key.
 - **A short tap still flashes.** Releasing the key does not stop the flash. A tap too short to start the engine flashes for 3 seconds and then shows OFF, which is the feedback the request asks for.
 
@@ -49,4 +49,4 @@ The Starter key shows whether the engine is running (#561): the red START badge 
   - `onWillDisappear` and a settings change clear the timer, and no frame is drawn after it;
   - the hold and release calls are the same as without the setting;
   - `starterArtwork` with two arguments returns exactly today's output.
-- **Manual:** on a Stream Deck, set a Starter key's Flash while starting, stall the car and press Starter. The key should flash and go green as the engine catches. Tap it briefly instead: it should flash for 3 seconds and return to OFF. Also check a Stream Deck+ dial set to Starter, and a Mirabox knob.
+- **Manual:** on a Stream Deck, set a Starter key's Flash while starting, stall the car and press Starter. The key should flash and go green as the engine catches. Tap it briefly instead: it should flash for 3 seconds and return to OFF. Also check a key with no Starter binding: it shows the warning and does not flash.
