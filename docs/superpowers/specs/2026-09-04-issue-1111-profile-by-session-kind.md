@@ -93,7 +93,7 @@ deck-core is sim-neutral and may not import an iRacing package (#1351), so the p
 
 ## Open questions
 
-- **Do user edits survive a plugin update that re-ships the profile file?** This matters more here than anywhere, since these profiles exist to be edited. Bundled profiles do not reliably auto-install on updates, which suggests edits persist, but nothing has measured a _changed_ file against an edited install. Task: edit an installed bundled profile, ship a build with a modified file, observe. If edits are lost, the fallback is `AutoInstall: false` for these profiles plus a documented export-and-reimport step.
+- **Do user edits survive a plugin update that re-ships the profile file?** Answered 2026-10-24 by the maintainer, on hardware: yes. An installed bundled profile can be edited freely, and a plugin build that ships a changed file for it does not overwrite the local edits. The profiles keep `AutoInstall: true`; the `AutoInstall: false` fallback is not needed.
 
 ## Verification
 
