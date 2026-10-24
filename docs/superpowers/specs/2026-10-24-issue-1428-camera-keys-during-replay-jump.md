@@ -131,7 +131,7 @@ The keypad rule here is the same rule, and it is the same code: there is one hel
 
 **Unit, the walk interrupt** (`fastest-lap-press.test.ts`, `race-start-press.test.ts`, `lap-walk.test.ts`, `camera-switch-waiter.test.ts`):
 
-- a camera key during each phase of the walk (its opening pause, a bisection probe's seek, a lap-step search, the nudge, the back-step): the walk sends no further probe; the replay is put back on the press's frame at its captured speed (playing and paused); the press's camera move is undone when it made one, and not otherwise; the key's switch goes out after all of that, once; nothing is recorded into the lap record;
+- a camera key during each phase of the walk (its opening pause, a bisection probe's seek, a lap-step search, the nudge, a crossing probe and the final approach jump of #1432): the walk sends no further probe; the replay is put back on the press's frame at its captured speed (playing and paused); the press's camera move is undone when it made one, and not otherwise; the key's switch goes out after all of that, once; nothing is recorded into the lap record;
 - interrupted in its opening pause (no origin frame read): only the captured speed is sent, and nothing when it is zero;
 - a replay key pressed during the put-back cancels the claim and the put-back sends nothing more; the replay key's command stands;
 - leaving the replay during a walk still cancels it with no put-back;
