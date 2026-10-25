@@ -55,7 +55,7 @@ Unchanged from #810: the schema default is Legacy with `.catch("legacy")` (and `
 
 - **Format.** The integer level without a unit, `55`, the same text the Audio Controls dial shows. Units are dropped as in #810, and percent is the only unit these levels have.
 - **Feature off.** While the Race Engineer or the Radar is switched off, the value reads **OFF**, as the dial does. Pressing still steps the level, as it does today on the key and the dial, and the number returns when the feature is switched on. Rejected: showing the number while off, which reads as audible; showing both, which does not fit at Split's value size.
-- **Refresh.** The level is a global setting, not telemetry, so these keys re-render on a global-settings change rather than on SDK ticks. That one listener covers every writer: the key, its partner, the dial, the Settings window sliders, the Pit Crew toggles. Re-renders are memoized on the shown string (`"55"`, `"OFF"`) and go through `IconUpdateThrottle`. Keys with no level subscribe to nothing; their icon changes only with their settings or binding state.
+- **Refresh.** The level is a global setting, not telemetry, so these keys re-render on a global-settings change rather than on SDK ticks. deck-core's base action already does exactly that: it subscribes to `onGlobalSettingsChange` once and re-runs every context's regenerate callback, which reads the level live. That covers every writer: the key, its partner, the dial, the Settings window sliders, the Pit Crew toggles. No second listener is added (amended during implementation): a memoized one could not stop the base's re-render and would only send the same image twice. Keys with no level read nothing global beyond what every key does.
 
 ## Hold to repeat
 
@@ -70,8 +70,7 @@ On for every volume key in any style but Legacy, through `RepeatController` with
 
 - a volume key description: the label, the direction, and either a level reader or none;
 - the stored-style resolution (the table above, applied only when there is no level reader);
-- the render entry, which returns the styled icon or `null` for Legacy, so each action falls back to its existing renderer exactly as the setup actions do;
-- the memo value for the level-showing keys.
+- the render entry, which returns the styled icon or `null` for Legacy, so each action falls back to its existing renderer exactly as the setup actions do.
 
 Each action maps its own settings to a description: Audio Controls from `{category, action}`, reading the level through `INTERNAL_AUDIO_BUSES`; AI Spotter Controls from `louder` / `quieter`. The shared module imports from neither action folder: the level reader is handed in. Each action keeps its own `RepeatController`, as the setup actions do. Two additions to `adjust-styles.ts` are generic catalog knowledge: the value-style → no-value-style mapping and the label-on-no-value-styles render option.
 
@@ -103,9 +102,9 @@ Both actions' keypad schemas spread `adjustStyleSettingsFields`; both fields car
 
 Suite:
 
-- **`volume-key-styles`.** Style resolution: each value style maps to its no-value form only on a key without a level reader, Legacy returns `null`, the no-value styles pass through. The label is shown by default on no-value styles and a title override still hides or changes it. The level renders as `55`, `0`, `100` and `OFF`. The memo value changes only when the shown string does.
+- **`volume-key-styles`.** Style resolution: each value style maps to its no-value form only on a key without a level reader, Legacy returns `null`, the no-value styles pass through. The label is shown by default on no-value styles and a title override still hides or changes it. The level renders as `55`, `0`, `100` and `OFF`.
 - **`adjust-styles`.** The new render option is off by default: every existing setup-action expectation passes unchanged. The mapping covers all three value styles.
-- **Audio Controls.** A fresh key is seeded with Split and the `addedWithVersion` stamp written after it still carries it; a configured key is not seeded; the #1015 migration still runs. Each of the eight volume pairs renders through the shared module and every other pair through the existing renderer; a #1196 unavailable pair keeps its warning icon. A global-settings change re-renders a Race Engineer key only when its level or enabled state changed. Repeat with mocked timers: a quick tap steps once, a hold repeats, release stops it, for a Master key (repeated `tapBinding`) and a Radar key (repeated `stepBy`). A missing Master binding shows the #612 overlay.
+- **Audio Controls.** A fresh key is seeded with Split and the `addedWithVersion` stamp written after it still carries it; a configured key is not seeded; the #1015 migration still runs. Each of the eight volume pairs renders through the shared module and every other pair through the existing renderer; a #1196 unavailable pair keeps its warning icon. A global-settings change re-renders a Race Engineer key with its new level, or OFF. Repeat with mocked timers: a quick tap steps once, a hold repeats, release stops it, for a Master key (repeated `tapBinding`) and a Radar key (repeated `stepBy`). A missing Master binding shows the #612 overlay.
 - **AI Spotter Controls.** Seeding as above, Louder / Quieter render and repeat, the report and Skip Spotter Call keys unchanged, an unknown stored `control` keeps `keyStyle`.
 - `pnpm build` (the PI partial compiles into all three plugins), `pnpm typecheck`, `lint`, `format`, `test`.
 
