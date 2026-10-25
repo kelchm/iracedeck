@@ -13,7 +13,7 @@ The Starter key shows whether the engine is running (#561): the red START badge 
 - **It stops early when the engine is running.** The first time `starterToggleState` reads `on`, the flash ends and the key shows the normal green ON look.
 - **If the engine has not started after 3 seconds**, the flash ends and the key shows whatever telemetry says, normally the dimmed OFF look.
 - **A press while the flash runs restarts the 3 seconds.** A press while the engine is already running starts no flash, and neither does one with no Starter binding set: that press sent nothing, so the key must not claim to be cranking. The press must itself be a Starter press as well as the stored Mode, so a Mode change landing during another control's send does not flash.
-- **It is display only.** The press-and-hold behaviour is unchanged: the binding is held on press and released on release exactly as today, and the flash is started after the hold is sent, so it never delays the key.
+- **It is display only.** The press-and-hold behaviour is unchanged: the binding is held on press and released on release exactly as today, and the flash starts with the press, while the hold is still being sent: a SimHub-role hold is an HTTP round trip, and starting after it resolved meant an engine that caught during it ended the flash before it was seen (found on hardware). The first frame waits a macrotask, so the hold's request still leaves first and the flash never delays the key.
 - **A short tap still flashes.** Releasing the key does not stop the flash. A tap too short to start the engine flashes for 3 seconds and then shows OFF, which is the feedback the request asks for.
 
 ## Mechanics
