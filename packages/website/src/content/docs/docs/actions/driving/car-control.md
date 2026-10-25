@@ -136,6 +136,9 @@ Engage the car starter. Hold the button to crank.
   - **On** — green `ON` bar and green border — the engine is running
   - **Off** — red `OFF` bar and red border — the engine is not running; press to crank
   - **Not available** — grey `N/A` bar and grey border when there's no live telemetry (disconnected, in a replay, or not in the car) — it does not mean the car has no starter. The button stays usable — pressing it still sends the configured binding.
+  - **Cranking** — while you hold the button, the START badge flashes between dimmed and full strength, slowly at first and then faster, over the real bar and border; it stops when you let go, or as soon as the engine catches and the key turns green
+  - **Already running** — a press gives a single short blink, then the normal `ON` look
+  - **No flash** — with no Starter key binding set
 
 #### Settings
 

@@ -155,6 +155,23 @@ const ESC_KEY = { key: "escape", code: "Escape" } as const;
 const AUTO_HOLD_DURATION = 1500;
 
 /**
+ * How long each frame of the Starter's cranking flash lasts (issue #1438): slow first, then
+ * faster, like a starter spinning up. The last length repeats for as long as the key is
+ * held; at 120 ms it stays under the 10 Hz cap the key's other updates keep.
+ *
+ * @internal Exported for testing
+ */
+export const STARTER_CRANK_FRAMES_MS = [450, 380, 320, 270, 230, 190, 160, 140, 120] as const;
+
+/**
+ * The single dimmed blink a Starter press gives when the engine is already running — the one
+ * "chuk" of a starter tried on a running engine (issue #1438).
+ *
+ * @internal Exported for testing
+ */
+export const STARTER_CHUK_MS = 200;
+
+/**
  * @internal Exported for testing
  *
  * Parse the pit speed limit from session info string (e.g. "80.00 kph") to an integer.
@@ -540,6 +557,25 @@ export function starterToggleState(telemetry: TelemetryData | null): ToggleState
 }
 
 /**
+ * @internal Exported for testing
+ *
+ * Whether the engine has CAUGHT, as opposed to being cranked (issue #1438). iRacing clears
+ * EngineStalled as soon as the starter turns the engine over, so starterToggleState reads
+ * "on" from the first crank (found on hardware). A cranking engine turns well below idle, so
+ * the same RPM floor isEngineRunning falls back on tells the two apart. Without RPM the
+ * stall bit is all there is.
+ */
+export function hasEngineCaught(telemetry: TelemetryData | null): boolean {
+  if (starterToggleState(telemetry) !== "on") return false;
+
+  const rpm = telemetry?.RPM;
+
+  if (typeof rpm !== "number" || !Number.isFinite(rpm)) return true;
+
+  return rpm >= ENGINE_RUNNING_RPM_FLOOR;
+}
+
+/**
  * Power-symbol artwork for the Ignition key, carried over from the static icon and
  * sized to whatever band is left for it: y 32..96 under the one-line title (whose
  * baseline sits at 26), or y 8..96 when the title is hidden. The status bar always
@@ -584,10 +620,14 @@ export function ignitionArtwork(state: ToggleState, showTitle: boolean): string 
  * fills the whole area above the status bar. If a user opts a title back in through
  * Title Overrides it shrinks to leave room, which is the pit-limiter pattern.
  *
+ * `lit` decides the badge strength separately from the state, so a flash frame can draw
+ * the full-strength badge over an OFF status bar (issue #1438). It defaults to the state,
+ * so the two-argument form draws exactly what it always has.
+ *
  * @internal Exported for testing
  */
-export function starterArtwork(state: ToggleState, showTitle: boolean): string {
-  const dim = state === "on" ? "" : ' opacity="0.45"';
+export function starterArtwork(state: ToggleState, showTitle: boolean, lit = state === "on"): string {
+  const dim = lit ? "" : ' opacity="0.45"';
   const cy = showTitle ? 62 : 53;
   const r = showTitle ? 32 : 39;
   const inner = Math.round(r * 0.8);
@@ -645,6 +685,11 @@ export type CarControlTelemetryState = {
   ignitionState?: ToggleState;
   /** Tri-state engine-running indication shown on the Starter key (issue #561). */
   starterState?: ToggleState;
+  /**
+   * Draws the Starter badge lit or dimmed regardless of `starterState`, for a frame of the
+   * flash while starting (issue #1438). Undefined follows the state.
+   */
+  starterBadgeLit?: boolean;
 };
 
 /**
@@ -841,7 +886,7 @@ export function generateCarControlSvg(
     const resolvedTitle = resolveTitleSettings(template, getGlobalTitleSettings(), settings.titleOverrides);
     const artwork = isIgnition
       ? ignitionArtwork(state, resolvedTitle.showTitle)
-      : starterArtwork(state, resolvedTitle.showTitle);
+      : starterArtwork(state, resolvedTitle.showTitle, telemetryState?.starterBadgeLit);
 
     return generateToggleStateSvg({
       template,
@@ -890,6 +935,25 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
   private autoHoldTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
+   * Running Starter flashes per action context (issue #1438). While an entry exists the
+   * flash owns the key image and telemetry ticks do not draw over it.
+   */
+  private starterFlashes = new Map<
+    string,
+    {
+      /** `crank` runs while the key is held; `chuk` is the single blink on a running engine. */
+      kind: "crank" | "chuk";
+      /** The pending timeout: the next frame of a crank, or the end of a chuk. */
+      timer: ReturnType<typeof setTimeout>;
+      /** Index into STARTER_CRANK_FRAMES_MS of the frame on screen. */
+      frame: number;
+      lit: boolean;
+      /** The highest RPM seen during the flash, logged when it ends to calibrate the catch. */
+      maxRpm: number;
+    }
+  >();
+
+  /**
    * Caps per-key icon updates at 10 Hz with a trailing-edge coalescer
    * (issue #493). The SDK now ticks at ~70 Hz with SessionTick dedupe;
    * a fast-changing telemetry-driven control (DRS, push-to-pass blinking)
@@ -923,6 +987,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
     // release / super so a queued trailing flush (up to 100 ms) can't fire
     // and call `updateKeyImage` for a context that's mid-teardown.
     this.imageThrottle.clear(ev.action.id);
+    this.stopStarterFlash(ev.action.id);
     this.activeContexts.delete(ev.action.id);
     this.lastState.delete(ev.action.id);
 
@@ -944,6 +1009,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
 
   override async onDidReceiveSettings(ev: IDeckDidReceiveSettingsEvent<CarControlSettings>): Promise<void> {
     await super.onDidReceiveSettings(ev);
+    this.stopStarterFlash(ev.action.id);
     const settings = this.parseSettings(ev.payload.settings);
     this.activeContexts.set(ev.action.id, settings);
     const globalKey = CAR_CONTROL_GLOBAL_KEYS[settings.control];
@@ -963,6 +1029,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
 
   override async onKeyUp(ev: IDeckKeyUpEvent<CarControlSettings>): Promise<void> {
     this.logger.info("Key up received");
+    this.releaseStarterFlash(ev.action.id);
     const settings = this.parseSettings(ev.payload.settings);
 
     if (settings.control === "escape") {
@@ -993,6 +1060,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
 
   override async onDialUp(ev: IDeckDialUpEvent<CarControlSettings>): Promise<void> {
     this.logger.info("Dial up received");
+    this.releaseStarterFlash(ev.action.id);
     const settings = this.parseSettings(ev.payload.settings);
 
     if (settings.control === "escape") {
@@ -1042,10 +1110,167 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
     }
 
     if (HOLD_CONTROLS.has(settings.control)) {
-      await this.holdBinding(actionId, settingKey);
+      // The Starter flash (issue #1438) starts with the press, not after the hold resolves:
+      // a SimHub role's hold is an HTTP round trip, and an engine that catches during it
+      // would end the flash before it was ever seen. Its first frame waits a macrotask, so
+      // the hold's request still leaves first.
+      const held = this.holdBinding(actionId, settingKey);
+
+      this.startStarterFlashIfWanted(actionId, settings);
+      await held;
     } else {
       await this.tapBinding(settingKey);
     }
+  }
+
+  /**
+   * The press (what is being sent) and the stored settings (what the key is) must both be a
+   * Starter, and an unbound Starter sends nothing, so it does not claim to be cranking. A
+   * running engine gets the single chuk blink; anything else gets the cranking flash. A PI
+   * change that lands during the hold's await reaches onDidReceiveSettings, which stops it.
+   */
+  private startStarterFlashIfWanted(actionId: string, settings: CarControlSettings): void {
+    if (settings.control !== "starter" || this.activeContexts.get(actionId)?.control !== "starter") return;
+
+    if (this.isBindingMissing(CAR_CONTROL_GLOBAL_KEYS.starter)) {
+      this.logger.debug("Starter flash skipped: no Starter binding");
+
+      return;
+    }
+
+    this.startStarterFlash(actionId, hasEngineCaught(this.sdkController.getCurrentTelemetry()) ? "chuk" : "crank");
+  }
+
+  /**
+   * Starts (or restarts) a Starter flash (issue #1438). The status bar and border keep the
+   * real state throughout; only the badge flashes.
+   *
+   * - `crank`: the badge alternates lit and dimmed, beginning lit, each frame shorter than
+   *   the last (STARTER_CRANK_FRAMES_MS), for as long as the key is held. Releasing the key
+   *   ends it — nothing is cranking then — and so does the engine catching (hasEngineCaught).
+   * - `chuk`: one dimmed frame of STARTER_CHUK_MS over the running engine's ON look.
+   *
+   * The first frame waits a macrotask, so the hold's request leaves first.
+   */
+  private startStarterFlash(contextId: string, kind: "crank" | "chuk"): void {
+    this.stopStarterFlash(contextId);
+    // A trailing throttled render queued before the press would draw over the first frame.
+    this.imageThrottle.clear(contextId);
+
+    const flash = {
+      kind,
+      timer: setTimeout(() => this.showFirstStarterFrame(contextId), 0),
+      frame: 0,
+      lit: kind === "crank",
+      maxRpm: 0,
+    };
+    this.starterFlashes.set(contextId, flash);
+    this.logger.debug(`Starter flash started: ${kind}`);
+  }
+
+  private showFirstStarterFrame(contextId: string): void {
+    const flash = this.starterFlashes.get(contextId);
+
+    if (!flash) return;
+
+    if (!this.drawStarterFlashFrame(contextId)) return;
+
+    if (flash.kind === "chuk") {
+      flash.timer = setTimeout(() => this.endStarterFlash(contextId, "chuk done"), STARTER_CHUK_MS);
+    } else {
+      flash.timer = setTimeout(() => this.stepStarterFlash(contextId), STARTER_CRANK_FRAMES_MS[0]);
+    }
+  }
+
+  /** The next crank frame: toggle, draw, and wait the next (shorter) frame length. */
+  private stepStarterFlash(contextId: string): void {
+    const flash = this.starterFlashes.get(contextId);
+
+    if (!flash) return;
+
+    flash.frame = Math.min(flash.frame + 1, STARTER_CRANK_FRAMES_MS.length - 1);
+    flash.lit = !flash.lit;
+
+    if (!this.drawStarterFlashFrame(contextId)) return;
+
+    flash.timer = setTimeout(() => this.stepStarterFlash(contextId), STARTER_CRANK_FRAMES_MS[flash.frame]);
+  }
+
+  /** The key or dial is released: a cranking flash ends, since nothing is cranking now. */
+  private releaseStarterFlash(contextId: string): void {
+    if (this.starterFlashes.get(contextId)?.kind === "crank") {
+      this.endStarterFlash(contextId, "released");
+    }
+  }
+
+  /** Ends the flash and draws the real state now, rather than waiting for a telemetry tick. */
+  private endStarterFlash(contextId: string, reason: string): void {
+    const maxRpm = this.starterFlashes.get(contextId)?.maxRpm ?? 0;
+
+    this.stopStarterFlash(contextId);
+    this.lastState.delete(contextId);
+    this.logger.debug(`Starter flash ended: ${reason} (max RPM ${Math.round(maxRpm)})`);
+
+    const settings = this.activeContexts.get(contextId);
+
+    if (settings) {
+      void this.updateDisplayFromTelemetry(contextId, this.sdkController.getCurrentTelemetry(), settings);
+    }
+  }
+
+  private stopStarterFlash(contextId: string): void {
+    const flash = this.starterFlashes.get(contextId);
+
+    if (flash) {
+      clearTimeout(flash.timer);
+      this.starterFlashes.delete(contextId);
+    }
+  }
+
+  /** Records the RPM a flash has seen, so its end can log how high cranking went. */
+  private noteStarterFlashRpm(contextId: string, telemetry: TelemetryData | null): void {
+    const flash = this.starterFlashes.get(contextId);
+    const rpm = telemetry?.RPM;
+
+    if (flash && typeof rpm === "number" && Number.isFinite(rpm)) flash.maxRpm = Math.max(flash.maxRpm, rpm);
+  }
+
+  /**
+   * Draws the flash's current frame, straight to updateKeyImage: at most ~8 Hz, under the
+   * throttle's 10 Hz cap. A cranking frame reads the same telemetry a tick would, so the
+   * engine catching ends the flash here too. Returns false when the flash ended instead.
+   */
+  private drawStarterFlashFrame(contextId: string): boolean {
+    const flash = this.starterFlashes.get(contextId);
+
+    if (!flash) return false;
+
+    const settings = this.activeContexts.get(contextId);
+
+    if (!settings || settings.control !== "starter") {
+      this.stopStarterFlash(contextId);
+
+      return false;
+    }
+
+    const telemetry = this.sdkController.getCurrentTelemetry();
+
+    this.noteStarterFlashRpm(contextId, telemetry);
+
+    if (flash.kind === "crank" && hasEngineCaught(telemetry)) {
+      this.endStarterFlash(contextId, "engine running");
+
+      return false;
+    }
+
+    const state = this.getTelemetryState(telemetry, "starter", contextId);
+    const svgDataUri = generateCarControlSvg(settings, state, this.isBindingMissing(CAR_CONTROL_GLOBAL_KEYS.starter));
+
+    void this.updateKeyImage(contextId, svgDataUri).catch((err) =>
+      this.logger.error(`Starter flash frame failed: ${err}`),
+    );
+
+    return true;
   }
 
   /**
@@ -1143,7 +1368,16 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
     }
   }
 
-  private getTelemetryState(telemetry: TelemetryData | null, control: CarControlType): CarControlTelemetryState {
+  /**
+   * `contextId` lets a running Starter flash (issue #1438) put its current frame into the
+   * state, so every path that renders the key — the frame step, the regenerate callback a
+   * global-settings change runs — draws the same frame rather than the bare state.
+   */
+  private getTelemetryState(
+    telemetry: TelemetryData | null,
+    control: CarControlType,
+    contextId?: string,
+  ): CarControlTelemetryState {
     const state: CarControlTelemetryState = {};
 
     if (control === "pit-speed-limiter") {
@@ -1162,6 +1396,10 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
       state.ignitionState = ignitionToggleState(telemetry);
     } else if (control === "starter") {
       state.starterState = starterToggleState(telemetry);
+
+      const flash = contextId === undefined ? undefined : this.starterFlashes.get(contextId);
+
+      if (flash) state.starterBadgeLit = flash.lit;
     }
 
     return state;
@@ -1183,7 +1421,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
     await this.setKeyImage(ev, svgDataUri);
     this.setRegenerateCallback(ev.action.id, () => {
       const currentTelemetry = this.sdkController.getCurrentTelemetry();
-      const currentState = this.getTelemetryState(currentTelemetry, settings.control);
+      const currentState = this.getTelemetryState(currentTelemetry, settings.control, ev.action.id);
 
       return generateCarControlSvg(
         settings,
@@ -1246,6 +1484,21 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
   ): Promise<void> {
     if (!TELEMETRY_AWARE_CONTROLS.has(settings.control)) return;
 
+    // The Starter flash owns the image while it runs (issue #1438): the tick draws nothing,
+    // so the two never interleave, except that the engine catching ends a cranking flash
+    // at once. Cranking alone reads as running, so the catch is judged by hasEngineCaught.
+    const flash = this.starterFlashes.get(contextId);
+
+    if (flash) {
+      this.noteStarterFlashRpm(contextId, telemetry);
+
+      if (flash.kind !== "crank" || !hasEngineCaught(telemetry)) return;
+
+      this.endStarterFlash(contextId, "engine running");
+
+      return;
+    }
+
     const telemetryState = this.getTelemetryState(telemetry, settings.control);
     const stateKey = this.buildStateKey(settings, telemetryState);
     const lastStateKey = this.lastState.get(contextId);
@@ -1264,7 +1517,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
       if (!storedSettings || !TELEMETRY_AWARE_CONTROLS.has(storedSettings.control)) return;
 
       const currentTelemetry = this.sdkController.getCurrentTelemetry();
-      const currentState = this.getTelemetryState(currentTelemetry, storedSettings.control);
+      const currentState = this.getTelemetryState(currentTelemetry, storedSettings.control, contextId);
       const svgDataUri = generateCarControlSvg(
         storedSettings,
         currentState,
@@ -1273,7 +1526,7 @@ export class CarControl extends SimIRacingAction<CarControlSettings> {
       await this.updateKeyImage(contextId, svgDataUri);
       this.setRegenerateCallback(contextId, () => {
         const t = this.sdkController.getCurrentTelemetry();
-        const s = this.getTelemetryState(t, storedSettings.control);
+        const s = this.getTelemetryState(t, storedSettings.control, contextId);
 
         return generateCarControlSvg(
           storedSettings,
