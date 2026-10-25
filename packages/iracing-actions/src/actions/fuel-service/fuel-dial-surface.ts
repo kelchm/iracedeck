@@ -56,6 +56,7 @@ import {
   resolveDisplayUnits,
   TOGGLE_AUTOFUEL_KEY,
 } from "./fuel-service-settings.js";
+import { type FuelStepper, type FuelStepResult, readPitSvFuel } from "./fuel-step.js";
 
 /**
  * Push + Turn pair members — directional fuel endpoints dispatched per pressed
@@ -435,20 +436,6 @@ export function readFuelLevel(telemetry: TelemetryData | null): number {
   const value = telemetry.FuelLevel;
 
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
-}
-
-/**
- * @internal Exported for testing
- *
- * Reads `PitSvFuel` (the requested pit fuel add, liters) from telemetry, or
- * undefined when unavailable.
- */
-export function readPitSvFuel(telemetry: TelemetryData | null): number | undefined {
-  if (!telemetry) return undefined;
-
-  const value = telemetry.PitSvFuel;
-
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 /**
@@ -1000,6 +987,8 @@ export class FuelDialSurface {
   constructor(
     private readonly host: FuelDialHost,
     private readonly pipeline: FuelPipeline,
+    /** The action's fuel step check (#1314), shared with the keypad: the Add Amount rotation sends through it. */
+    private readonly stepper: FuelStepper,
   ) {}
 
   async willAppear(action: IDeckActionContext, settings: FuelServiceSettings): Promise<void> {
@@ -1378,6 +1367,15 @@ export class FuelDialSurface {
       return;
     }
 
+    // Add Amount goes through the fuel step check (#1314): a detent smaller than
+    // the car's fuel step rounds back in iRacing, so the check steps further. A
+    // target of 0 keeps its clear (below), and Fill To is unchanged.
+    if (ctx.settings.dial.mode === "add-amount" && target > 0) {
+      this.sendAddAmountStep(ctx, target);
+
+      return;
+    }
+
     this.pipeline.sendFuel(target);
     ctx.throttle.lastSentLtr = target;
     // Keep the continuous fill-to monitor's per-litre re-send gate in sync with
@@ -1389,6 +1387,121 @@ export class FuelDialSurface {
     this.host.logger.info("Fuel request sent");
     this.host.logger.debug(`Sent ${target.toFixed(2)}L`);
     void this.renderFeedback(ctx);
+  }
+
+  /**
+   * Sends an Add Amount rotation through the fuel step check (#1314). The
+   * request is resolved when the step STARTS — from the dialed value at that
+   * moment, against the live `PitSvFuel` — because a rotation that arrives while
+   * another check runs waits in the stepper's queue and must run from the
+   * baseline that check left. The direction is the request's side of that
+   * baseline, which is the rotation's direction, decided in whole liters — what
+   * the stepper actually sends: a request that rounds to the banked amount is
+   * sent once without a check, so a turn still arms fueling as it always has.
+   */
+  private sendAddAmountStep(ctx: FuelDialContext, target: number): void {
+    ctx.throttle.lastSentLtr = target;
+    ctx.lastSentWholeAdd = Math.round(fuelToDisplayUnits(target, this.effectiveDisplayUnits(ctx)));
+    // Debug only: the step may yet be queued and superseded without sending
+    // anything. The info line comes from onAddAmountStepEnd, once it has sent.
+    this.host.logger.debug(`Add Amount ${target.toFixed(2)}L handed to the fuel step check`);
+
+    // The dialed add when the step started, kept fractional: the re-base in
+    // onAddAmountStepEnd measures detents turned since against it, not
+    // against the rounded request.
+    let startLtr: number | null = null;
+
+    void this.stepper.sendFuelStep(
+      (baselineLtr) => {
+        startLtr = this.effectiveAddLtr(ctx);
+        const requestLtr = Math.round(startLtr);
+        const bankLtr = Math.round(baselineLtr);
+        const direction = requestLtr > bankLtr ? "add" : requestLtr < bankLtr ? "reduce" : null;
+
+        return { direction, firstLtr: requestLtr };
+      },
+      (result) => this.onAddAmountStepEnd(ctx, startLtr, result),
+    );
+    void this.renderFeedback(ctx);
+  }
+
+  /**
+   * Re-bases the dial on what an Add Amount step left banked (#1314). After a
+   * step that escalated, `PitSvFuel` is past the dialed value — on the MX-5 a
+   * one-liter detent banks a whole gallon — and the dialed value must follow it,
+   * or the next clockwise detent (dialed value + step) would sit BELOW the bank
+   * and lower the request. Detents turned while the check ran are kept on top
+   * of the bank, so the queued step (which reads the dialed value when it
+   * starts) runs from the new baseline. The rotate throttle's no-op baseline
+   * (`lastSentLtr`) moves to the settled value only when nothing was turned
+   * meanwhile; otherwise it keeps the last handed-over target, so a trailing
+   * flush still sends the extra detents. An emptied request (a reduce stepping
+   * past the last step, sent as 1 L + clear) settles at 0 with the baselines
+   * nulled, as every clear does. `pipeline.lastPitWasClear` needs nothing: it
+   * already reflects the step's last command (`pit.fuel` or the clear).
+   *
+   * A step whose own request landed (no extra liters, so every whole-liter car)
+   * leaves the dial exactly as before #1314: the dialed value keeps its
+   * fraction — a 1 gal step on a liter car still adds 3.785 L per detent over a
+   * spin, not the whole liters each rounded send banks.
+   *
+   * `startLtr` is the dialed add when the step started (null when it never
+   * started), the fractional value the detents turned since are measured from.
+   */
+  private onAddAmountStepEnd(ctx: FuelDialContext, startLtr: number | null, result: FuelStepResult): void {
+    this.logAddAmountStepEnd(result);
+
+    // Switched to Fill To while the check ran: the switch sends no pipeline
+    // command, so it cancelled nothing, and its re-seed has already set the
+    // dialed value to a TOTAL. Re-basing an add on top of it would be wrong.
+    if (ctx.settings.dial.mode !== "add-amount") return;
+
+    const steppedPast = result.outcome === "landed" && result.extraLtr > 0;
+
+    if (!steppedPast && result.outcome !== "unmoved" && result.outcome !== "emptied") return;
+
+    if (startLtr === null) return;
+
+    const turnedSinceLtr = ctx.dialValueLtr - startLtr;
+    const bankedLtr = result.outcome === "emptied" ? 0 : (result.endLtr ?? result.baselineLtr ?? 0);
+    ctx.dialValueLtr = clampTargetLtr(bankedLtr + turnedSinceLtr, this.effectiveMaxLtr());
+
+    if (result.outcome === "emptied" && turnedSinceLtr === 0) {
+      ctx.throttle.lastSentLtr = null;
+      ctx.lastSentWholeAdd = null;
+
+      return;
+    }
+
+    if (turnedSinceLtr === 0) {
+      const settledLtr = this.effectiveAddLtr(ctx);
+      ctx.throttle.lastSentLtr = settledLtr;
+      ctx.lastSentWholeAdd =
+        settledLtr <= 0 ? null : Math.round(fuelToDisplayUnits(settledLtr, this.effectiveDisplayUnits(ctx)));
+    }
+  }
+
+  /** Logs what an Add Amount step sent, at info only when it sent something — as the keypad does. */
+  private logAddAmountStepEnd(result: FuelStepResult): void {
+    switch (result.outcome) {
+      case "landed":
+      case "unmoved":
+      case "unchecked":
+        this.host.logger.info("Fuel request sent");
+        this.host.logger.debug(
+          `Add Amount: pit.fuel(${result.sentLtr}) (${result.outcome}, +${result.extraLtr} L, baseline ${result.baselineLtr?.toFixed(2) ?? "unknown"}L)`,
+        );
+
+        return;
+
+      case "emptied":
+        this.host.logger.info("Fuel request emptied");
+
+        return;
+
+      default:
+        this.host.logger.debug(`Add Amount step ${result.outcome}`);
+    }
   }
 
   /**
@@ -1633,7 +1746,14 @@ export class FuelDialSurface {
     // would silently lower the target as fuel burns (PitSvFuel is the last-sent
     // add, not the live gap). Continuous monitoring (below) + the live add
     // computation keep the request matched to the burning fuel (issue #681).
-    if (ctx.settings.dial.mode === "add-amount" && Date.now() - ctx.lastUserActivity >= USER_ACTIVITY_GRACE_MS) {
+    //
+    // Never while a fuel step check runs (#1314): the check's own sends move
+    // `PitSvFuel`, and its end re-bases the dialed value on what was banked.
+    if (
+      ctx.settings.dial.mode === "add-amount" &&
+      Date.now() - ctx.lastUserActivity >= USER_ACTIVITY_GRACE_MS &&
+      !this.stepper.busy
+    ) {
       const pitFuel = readPitSvFuel(telemetry);
 
       if (pitFuel !== undefined) {
