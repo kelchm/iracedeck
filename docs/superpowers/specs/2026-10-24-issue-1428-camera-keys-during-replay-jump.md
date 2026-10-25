@@ -62,6 +62,10 @@ Rejected:
 - **A walk interrupted before it has read where the replay was** (in its opening pause, `origin.frame` still null) has moved the replay by its pause alone, so it sends only the captured speed, when that is not zero. `putReplayBack` today does nothing in that case, and a walk that gives up there is paused; the same addition fixes that too.
 - The waiter counts **an interrupted walk still winding down** (`isLapPressInFlight()` with its claim interrupted) as under way, so the key's switch goes out after the put-back seek has landed and after the walk's own camera move back, never into the put-back's seek. Without this the switch could go out in the gap between the interrupt and the put-back's seek (the walk unwinds at its next await, up to one **Fastest Lap Search Delay** later) and then be overridden by the walk's camera move back.
 
+**The search ends where the answer is found** (Niklas, 2026-10-24). Only the search is interruptible. Once a walk has its lap start (Jump to Race Start's jump to the green after its walk returns, and Jump to Fastest Lap's final approach jump under #1432), what is left is a plain jump: the walk's claim stops being interruptible, `interruptLapWalks` no longer matches it, and a camera key waits for that jump like any other (the open jump sequence holds it), so the replay lands on the lap that was asked for, the press's own camera step runs, and then the key's switch goes out.
+
+**A lap press drops a camera switch still waiting from before it** (Niklas, 2026-10-24). A switch parked behind an earlier jump (a marker, a Frame Jog spin) and a Jump to Fastest Lap or Jump to Race Start pressed after it: the lap press is the newer press, so it drops the waiting switch, logged at debug with the switch's name, and the walk runs undisturbed. Without this the older switch would go out at the walk's first quiet moment, interrupt the newer walk and put the replay back, which inverts newest-wins. A camera key pressed after the lap press interrupts as above.
+
 The answer to #1428's task "what the cursor API needs to tell a speed command from one that sets none" is therefore: **nothing**, for a jump, because under (a) a camera key never cancels one; and for a walk it is not a speed distinction either but a distinction between a press that takes the cursor (cancel, sends nothing more) and a camera switch that takes none (interrupt, puts back).
 
 ## The wait
@@ -131,7 +135,7 @@ The keypad rule here is the same rule, and it is the same code: there is one hel
 
 **Unit, the walk interrupt** (`fastest-lap-press.test.ts`, `race-start-press.test.ts`, `lap-walk.test.ts`, `camera-switch-waiter.test.ts`):
 
-- a camera key during each phase of the walk (its opening pause, a bisection probe's seek, a lap-step search, the nudge, a crossing probe and the final approach jump of #1432): the walk sends no further probe; the replay is put back on the press's frame at its captured speed (playing and paused); the press's camera move is undone when it made one, and not otherwise; the key's switch goes out after all of that, once; nothing is recorded into the lap record;
+- a camera key during each phase of the walk (its opening pause, a bisection probe's seek, a lap-step search, the nudge, a crossing probe of #1432): the walk sends no further probe; the replay is put back on the press's frame at its captured speed (playing and paused); the press's camera move is undone when it made one, and not otherwise; the key's switch goes out after all of that, once; nothing is recorded into the lap record;
 - interrupted in its opening pause (no origin frame read): only the captured speed is sent, and nothing when it is zero;
 - a replay key pressed during the put-back cancels the claim and the put-back sends nothing more; the replay key's command stands;
 - leaving the replay during a walk still cancels it with no put-back;
