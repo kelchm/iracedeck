@@ -18,6 +18,7 @@ import {
   generateTitleText,
   getGlobalBorderSettings,
   getGlobalTitleSettings,
+  type IDeckWillAppearEvent,
   renderIconTemplate,
   resolveBorderSettings,
   type ResolvedTitleSettings,
@@ -27,43 +28,22 @@ import {
   type TitleOverrides,
 } from "@iracedeck/deck-core";
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
+import type { ILogger } from "@iracedeck/logger";
 import { getGlobalColors } from "@iracedeck/settings";
-import z from "zod";
 
 import adjustStyleTemplate from "../../icons/adjust-style.svg";
+import { type AdjustKeyStyle, type PairPosition } from "./adjust-style-settings.js";
 import { formatViewValue, isViewSetting, VIEW_DEFS, type ViewSettingId, viewValueCenterY } from "./setup-view.js";
 
-/** Every selectable key style. Which subset applies depends on the mode kind (adjust vs View). */
-export const ADJUST_KEY_STYLES = [
-  "legacy",
-  // Value-showing directional styles (2-key pairs).
-  "edge-chevrons",
-  "split",
-  "joined-pill",
-  // No-value directional styles (3-key group outer keys; also fine standalone).
-  "big-glyph",
-  "big-chevron",
-  "pill-end",
-  // View-key display styles (3-key group middle).
-  "pill-middle-horizontal",
-  "pill-middle-vertical",
-] as const;
-
-export type AdjustKeyStyle = (typeof ADJUST_KEY_STYLES)[number];
-
-export const PAIR_POSITIONS = ["auto", "left", "right", "top", "bottom"] as const;
-export type PairPosition = (typeof PAIR_POSITIONS)[number];
-
-/**
- * Shared settings fields — spread into each action's `CommonSettings.extend`.
- * `.catch` (not just `.default`) so a value persisted by a newer plugin
- * version degrades to the default instead of failing the whole settings parse
- * (which would reset the key to full defaults — the 2.0 contamination bug).
- */
-export const adjustStyleSettingsFields = {
-  keyStyle: z.enum(ADJUST_KEY_STYLES).default("legacy").catch("legacy"),
-  pairPosition: z.enum(PAIR_POSITIONS).default("auto").catch("auto"),
-};
+// The catalog and settings fields live in the svg-free leaf; re-exported so
+// every existing import keeps working.
+export {
+  ADJUST_KEY_STYLES,
+  type AdjustKeyStyle,
+  adjustStyleSettingsFields,
+  PAIR_POSITIONS,
+  type PairPosition,
+} from "./adjust-style-settings.js";
 
 /** Gap between repeat steps while a paired key is held (≈ 6–7 steps/sec). */
 export const ADJUST_REPEAT_INTERVAL_MS = 150;
@@ -86,6 +66,30 @@ export function seedFreshKeyStyle(raw: unknown): Record<string, unknown> | null 
   if (Object.keys(obj).length > 0) return null;
 
   return { keyStyle: "split" };
+}
+
+/**
+ * Persist {@link seedFreshKeyStyle}'s seed for a freshly placed key and hand
+ * the seeded object on as `ev.payload.settings` (#1453). Called BEFORE
+ * `super.onWillAppear`: the base class stamps a missing `addedWithVersion`
+ * by writing `{...payload, addedWithVersion}`, so that write lands last and
+ * carries the seed. Logs and swallows a failed persist: the key then draws
+ * Legacy until the next write.
+ */
+export async function persistFreshKeyStyleSeed<T>(ev: IDeckWillAppearEvent<T>, logger: ILogger): Promise<void> {
+  const seeded = seedFreshKeyStyle(ev.payload.settings);
+
+  if (!seeded) return;
+
+  try {
+    await ev.action.setSettings(seeded);
+  } catch (err) {
+    logger.warn(`Failed to persist the seeded key style: ${err instanceof Error ? err.message : err}`);
+
+    return;
+  }
+
+  ev.payload.settings = seeded as T;
 }
 
 /**
@@ -129,6 +133,30 @@ const VALUE_SHOWING_STYLES: ReadonlySet<AdjustKeyStyle> = new Set([
 export function styleShowsValue(style: AdjustKeyStyle): boolean {
   return VALUE_SHOWING_STYLES.has(style);
 }
+
+/**
+ * The no-value form of each value-showing pair style (#1453): the look a key
+ * with no value to show draws in place of the stored style. Render-only — the
+ * stored style is never rewritten, so a key moved to a mode that has a value
+ * gets its chosen style back. Spec:
+ * docs/superpowers/specs/2026-10-18-issue-1453-volume-key-styles.md.
+ */
+const NO_VALUE_FORMS: ReadonlyMap<AdjustKeyStyle, AdjustKeyStyle> = new Map<AdjustKeyStyle, AdjustKeyStyle>([
+  ["split", "big-glyph"],
+  ["edge-chevrons", "big-chevron"],
+  ["joined-pill", "pill-end"],
+]);
+
+/**
+ * The style to draw when the key has no value: Split → Big +/−, Edge chevrons
+ * → Big chevrons, Joined pill → Pill end (Position in Pair carries over).
+ * Every other style is returned as it is.
+ */
+export function noValueFormOf(style: AdjustKeyStyle): AdjustKeyStyle {
+  return NO_VALUE_FORMS.get(style) ?? style;
+}
+
+const NO_VALUE_STYLES: ReadonlySet<AdjustKeyStyle> = new Set(["big-glyph", "big-chevron", "pill-end"]);
 
 const PILL_STYLES: ReadonlySet<AdjustKeyStyle> = new Set([
   "joined-pill",
@@ -223,6 +251,15 @@ export interface AdjustStyleRenderInputs {
   readonly titleOverrides?: TitleOverrides;
   readonly borderOverrides?: BorderOverrides;
   readonly bindingMissing?: boolean;
+  /**
+   * Show the label by default on the no-value styles (Big +/−, Big chevrons,
+   * Pill end) instead of hiding it (#1453). Off by default: in a setup
+   * action's 3-key group the View key in the middle carries the label. A
+   * volume pair has no middle key, so its keys pass `true`. Unlike the hidden
+   * default, the shown one is not locked, so the global title defaults and the
+   * per-key Title Overrides apply as on any other key.
+   */
+  readonly labelOnNoValueStyles?: boolean;
 }
 
 /** Placeholder when no telemetry value is available (same string as View keys). */
@@ -379,8 +416,14 @@ export function renderAdjustStyleSvg(inputs: AdjustStyleRenderInputs): string {
   const titleSource =
     style === "split"
       ? TITLE_SOURCE_TOP
-      : style === "big-glyph" || style === "big-chevron" || style === "pill-end"
-        ? TITLE_SOURCE_HIDDEN
+      : NO_VALUE_STYLES.has(style)
+        ? inputs.labelOnNoValueStyles
+          ? // A Pill end top key's frame is open at the bottom, toward its
+            // partner, so its label goes on the closed top stroke, as Joined pill's does.
+            style === "pill-end" && position === "top"
+            ? TITLE_SOURCE_TOP
+            : TITLE_SOURCE_BOTTOM
+          : TITLE_SOURCE_HIDDEN
         : (style === "edge-chevrons" && position === "bottom") || (style === "joined-pill" && position === "top")
           ? TITLE_SOURCE_TOP
           : TITLE_SOURCE_BOTTOM;

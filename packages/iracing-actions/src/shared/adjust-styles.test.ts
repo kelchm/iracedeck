@@ -9,6 +9,7 @@ import {
   isPillMiddleStyle,
   isPillStyle,
   isPositionAwareStyle,
+  noValueFormOf,
   pairedKeyNeedsTelemetry,
   resolvePairPosition,
   seedFreshKeyStyle,
@@ -487,5 +488,80 @@ describe("renderPairedIconOrNull", () => {
 
   it("returns null for a pill-middle style requested on an adjust mode", () => {
     expect(renderPairedIconOrNull({ ...common, setting: "brake-bias", keyStyle: "pill-middle-horizontal" })).toBeNull();
+  });
+});
+
+describe("noValueFormOf (#1453)", () => {
+  it("maps each value-showing pair style to its no-value form", () => {
+    expect(noValueFormOf("split")).toBe("big-glyph");
+    expect(noValueFormOf("edge-chevrons")).toBe("big-chevron");
+    expect(noValueFormOf("joined-pill")).toBe("pill-end");
+  });
+
+  it("returns every other style as it is", () => {
+    for (const style of [
+      "legacy",
+      "big-glyph",
+      "big-chevron",
+      "pill-end",
+      "pill-middle-horizontal",
+      "pill-middle-vertical",
+    ] as const) {
+      expect(noValueFormOf(style)).toBe(style);
+    }
+  });
+});
+
+describe("renderAdjustStyleSvg — labelOnNoValueStyles (#1453)", () => {
+  it("is off by default: the no-value styles render exactly as without the option", () => {
+    for (const style of ["big-glyph", "big-chevron", "pill-end"] as const) {
+      expect(renderAdjustStyleSvg({ ...BASE, style, labelOnNoValueStyles: false })).toBe(
+        renderAdjustStyleSvg({ ...BASE, style }),
+      );
+    }
+  });
+
+  it("shows the label on every no-value style when set", () => {
+    for (const style of ["big-glyph", "big-chevron", "pill-end"] as const) {
+      expect(decode(renderAdjustStyleSvg({ ...BASE, style, labelOnNoValueStyles: true }))).toContain(">BRAKE BIAS<");
+    }
+  });
+
+  it("re-centers the big glyph with the shown label, as a per-key override does", () => {
+    const svg = decode(renderAdjustStyleSvg({ ...BASE, style: "big-glyph", labelOnNoValueStyles: true }));
+    expect(svg).toContain('<g transform="translate(0, -12)">');
+  });
+
+  it("does not lock the shown label: a per-key override still hides it", () => {
+    const svg = decode(
+      renderAdjustStyleSvg({
+        ...BASE,
+        style: "big-chevron",
+        labelOnNoValueStyles: true,
+        titleOverrides: { showTitle: false },
+      }),
+    );
+    expect(svg).not.toContain("BRAKE BIAS");
+  });
+
+  it("puts a Pill end key's label on its closed stroke: the top for the top key, the bottom for the bottom key", () => {
+    for (const pairPosition of ["top", "bottom"] as const) {
+      const svg = decode(
+        renderAdjustStyleSvg({ ...BASE, style: "pill-end", pairPosition, labelOnNoValueStyles: true }),
+      );
+      const pathIndex = svg.indexOf("<path");
+
+      // A knockout is only carved where the label sits on a stroke, never on the open edge.
+      expect(svg.indexOf("<rect", pathIndex)).toBeGreaterThan(pathIndex);
+      expect(svg).toContain(">BRAKE BIAS<");
+    }
+  });
+
+  it("leaves the value styles unchanged", () => {
+    for (const style of ["split", "edge-chevrons", "joined-pill"] as const) {
+      expect(renderAdjustStyleSvg({ ...BASE, style, labelOnNoValueStyles: true })).toBe(
+        renderAdjustStyleSvg({ ...BASE, style }),
+      );
+    }
   });
 });
