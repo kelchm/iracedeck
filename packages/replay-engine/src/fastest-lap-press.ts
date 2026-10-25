@@ -386,18 +386,19 @@ export function pressJumpToFastestLap(request: {
  *      is no information, and another frame of the open interval is probed
  *      instead, up to `MAX_ABSENT_PROBES` of them (#1354).
  *   3. **Lap-step refinement.** `nextLap` / `prevLap` until
- *      `CarIdxLap[carIdx]` is the lap before the target, a distance nudge
- *      to that lap's end, and a `FASTEST_LAP_FINAL_BACKSTEP_TICKS`
- *      back-step, so the car is visibly approaching the line.
- *   4. **Record what was verified.** The landed frame goes into the record
- *      as the car's start of `targetLap` ONLY when the walk converged: the
- *      sample before the back-step showed the car on `targetLap − 1` at
- *      `dist ≥` `FASTEST_LAP_DIST_THRESHOLD` in the target session
- *      instance, and the sample at the back-stepped frame agreed on lap and
- *      session. Anything less — lap steps exhausted, a nudge that did not
- *      move, a landing in another lap or session — stays where it got to,
- *      warns `walk did not converge`, and records nothing: a later press
- *      would trust that frame forever.
+ *      `CarIdxLap[carIdx]` is the lap before the target.
+ *   4. **Find the line and record it** (#1432). From where a lap search left
+ *      the cursor (after one Next Lap nudge when that is not near enough),
+ *      absolute jumps bracket the frame `CarIdxLap` flips to `targetLap`
+ *      within `LAP_CROSSING_MAX_FRAMES` and bisect it to adjacent frames,
+ *      both in the target session instance. The first frame on `targetLap`
+ *      goes into the record as the car's start of it, and the cursor is left
+ *      `LAP_START_APPROACH_FRAMES` before it, where a record hit lands.
+ *      Anything less — lap steps exhausted, a nudge that did not move, no
+ *      flip within the bound, a probe in another lap or session — warns
+ *      `walk did not converge`, records nothing, and leaves the cursor a
+ *      second before where the lap search rested: a later press would trust
+ *      a recorded frame forever.
  *   5. **Leave the replay as the Replay jump playback setting says**
  *      (#1276), converged or not: at the speed it had at the press, at 1×,
  *      or paused (`applyReplayJumpPlayback`, recorded by the gate in the
@@ -419,7 +420,9 @@ export function pressJumpToFastestLap(request: {
  * replay commands from the car. A walk that gives up puts the replay back
  * on the frame and at the speed the press found it (#1354), and the camera
  * back on `viewedCarIdx`, the car that was on screen at the press, when the
- * press had moved it. Only when the sim does not honour the way back does
+ * press had moved it. A camera key that interrupts the walk (#1428 / #1435)
+ * ends the press the same way, and its own switch goes out after that. Only
+ * when the sim does not honour the way back does
  * the replay stay paused where the walk stopped, with the speed state saying
  * so, so the Play key plays.
  *
@@ -458,11 +461,19 @@ export async function walkToFastestLap(
     // The camera onto the target car before the walk: iRacing's lap search
     // is camera-focus-relative, so the walk must start on the right driver.
     // For viewed-car this is usually a no-op (the camera is already there);
-    // for always-my-car it actively re-frames.
+    // for always-my-car it actively re-frames. A camera key that interrupted
+    // the press during the wait (#1428 / #1435) wants another car: the
+    // switch is not made, and the walk stops at its first checkpoint.
+    let cameraMoved = false;
+
     if (cameraCarNum !== null) {
       await waitToSwitchCamera(jump.claim, FASTEST_LAP_LOG_LABEL);
 
-      if (!engineEnv().camera().switchNum(cameraCarNum, 0, 0)) {
+      if (jump.claim.interruptedBy !== null) {
+        // Nothing switched, so nothing to switch back.
+      } else if (engineEnv().camera().switchNum(cameraCarNum, 0, 0)) {
+        cameraMoved = true;
+      } else {
         // If the SDK refused, abort rather than walk the wrong driver.
         logger.warn("Jump to fastest lap: camera switch failed, aborting");
         logger.debug(`Failed switchNum: carNum=${cameraCarNum}, carIdx=${carIdx}`);
@@ -480,12 +491,16 @@ export async function walkToFastestLap(
       label: FASTEST_LAP_LOG_LABEL,
     });
 
-    // A walk that gave up has put the replay back where the press found it,
-    // whatever the setting says: nothing was jumped to. The camera the press
-    // moved onto the target car goes back too, once no seek is in flight.
+    // A walk that gave up, or that a camera key interrupted (#1428 / #1435),
+    // has put the replay back where the press found it, whatever the setting
+    // says: nothing was jumped to. The camera the press moved onto the target
+    // car goes back too, once no seek is in flight, and only when the press
+    // moved it; an interrupting key's own switch goes out after this.
     if (landing === null) {
       const viewedCarNum =
-        viewedCarIdx !== carIdx && viewedCarIdx >= 0 && viewedCarIdx !== 255 ? carNumberRawByIdx(viewedCarIdx) : null;
+        cameraMoved && viewedCarIdx !== carIdx && viewedCarIdx >= 0 && viewedCarIdx !== 255
+          ? carNumberRawByIdx(viewedCarIdx)
+          : null;
 
       if (viewedCarNum === null) return;
 

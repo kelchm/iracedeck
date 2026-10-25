@@ -2,9 +2,19 @@
  * The press machinery Jump to Fastest Lap and Jump to Race Start share
  * (#1467, out of `ReplayControl`): the one in-flight slot, the press's replay
  * jump and its claim on the cursor, the wait before a camera switch of its
- * own, and the jump to a frame with its log lines. One replay, one press: the
+ * own, the jump to a frame with its log lines, and the two ways a walk is
+ * stopped: cancelled by a replay command, or interrupted by a camera switch
+ * (#1428 / #1435). One replay, one press: the
  * slot is module state, where it was one per action instance. Every line goes
  * to the engine's `ReplayControl` scope, so the log reads as it did.
+ *
+ * An interrupted press still holds the slot while it puts the replay back and
+ * undoes its own camera move, so a second Jump to Fastest Lap or Jump to Race
+ * Start pressed meanwhile is ignored like any press during one in flight;
+ * only a cancel frees the slot early. A press that starts tells the
+ * {@link onLapPressStarted} listeners first: the camera-switch waiter drops a
+ * switch still waiting from before it (#1428 / #1435), which would otherwise
+ * interrupt this newer press's walk.
  */
 import type { TelemetryData } from "@iracedeck/iracing-sdk";
 import type { ILogger } from "@iracedeck/logger";
@@ -38,9 +48,56 @@ export class FastestLapPressCancelled extends Error {
   }
 }
 
+/**
+ * Thrown inside a lap walk when a camera switch interrupted its claim
+ * (`interruptLapWalks`, #1428 / #1435): the search stops, and unlike
+ * {@link FastestLapPressCancelled} the walk still holds the cursor, so
+ * `runFastestLapWalk` catches it and puts the replay back.
+ */
+export class LapWalkInterrupted extends Error {
+  constructor(readonly by: string) {
+    super(`walk interrupted by ${by}`);
+    this.name = "LapWalkInterrupted";
+  }
+}
+
+/**
+ * Throws why a walk must stop, or returns: {@link FastestLapPressCancelled}
+ * when a replay command took the cursor, else {@link LapWalkInterrupted} when
+ * a camera switch interrupted it. A cancel wins: nothing more may be sent.
+ */
+export function throwIfWalkStopped(claim: ReplayCursorClaim): void {
+  if (claim.cancelledBy !== null) throw new FastestLapPressCancelled(claim.cancelledBy);
+
+  if (claim.interruptedBy !== null) throw new LapWalkInterrupted(claim.interruptedBy);
+}
+
+/**
+ * The claim as a walk's own waits see it: stopped once it is cancelled or
+ * interrupted, so a probe's seek poll or the opening settle wait ends at its
+ * next read either way, and the walk then tells which with
+ * {@link throwIfWalkStopped}. Never for the way back (`putReplayBack`), which
+ * runs on an interrupted claim and stops only for a cancel.
+ */
+export function walkStopView(claim: ReplayCursorClaim): ReplayCursorClaim {
+  return {
+    owner: claim.owner,
+    get cancelledBy() {
+      return claim.cancelledBy ?? claim.interruptedBy;
+    },
+    get interruptedBy() {
+      return claim.interruptedBy;
+    },
+    get interruptible() {
+      return claim.interruptible;
+    },
+    release: () => claim.release(),
+  };
+}
+
 // The walks claim the replay cursor under the engine's FASTEST_LAP_WALK_OWNER
 // and RACE_START_WALK_OWNER (`lap-walk-owners.ts`), the two owners a camera
-// switch cancels.
+// switch interrupts.
 
 /** The owner name a record jump claims the replay cursor under while it waits for the landing (#1275). */
 export const FASTEST_LAP_RECORD_JUMP_OWNER = "jump-to-fastest-lap record jump";
@@ -106,6 +163,41 @@ export function isLapPressInFlight(): boolean {
   return activeLapPress !== null && activeLapPress.claim.cancelledBy === null;
 }
 
+/**
+ * Whether the press in the slot is past the part a camera switch may
+ * interrupt and still winding down (#1428 / #1435): a walk a camera switch
+ * interrupted, putting the replay back and undoing its own camera move; or a
+ * walk whose search has its answer (`endReplayCursorInterrupts`), jumping to
+ * the lap, or putting the replay back after a search that came to nothing,
+ * with its own camera step still to run. A camera switch waits for it, so it
+ * goes out after the press's last replay command and camera move and is not
+ * overridden by them.
+ */
+export function isLapPressWindingDown(): boolean {
+  if (!isLapPressInFlight() || activeLapPress === null) return false;
+
+  const { claim } = activeLapPress;
+
+  return claim.interruptedBy !== null || !claim.interruptible;
+}
+
+/** Who is told when a lap press starts. Module wiring, registered once at load: {@link _resetLapPress} leaves it. */
+const startListeners = new Set<(label: string) => void>();
+
+/**
+ * Runs `listener` whenever a Jump to Fastest Lap or Jump to Race Start press
+ * starts (past its guards, before it sends anything), with what opens the
+ * press's log lines. For the camera-switch waiter, which drops a switch still
+ * waiting from before the press (#1428 / #1435). Returns the unsubscribe.
+ */
+export function onLapPressStarted(listener: (label: string) => void): () => void {
+  startListeners.add(listener);
+
+  return () => {
+    startListeners.delete(listener);
+  };
+}
+
 /** The origin token of the press in the slot, for the ignored press's debug line. */
 export function activeLapPressOrigin(): string | undefined {
   return activeLapPress?.origin;
@@ -145,6 +237,9 @@ export async function holdLapPressSlot(
   target: { frame?: number; afterLanding?: (landing: TelemetryData) => boolean } = {},
 ): Promise<void> {
   const { owner, noun, label } = press;
+
+  for (const listener of [...startListeners]) listener(label);
+
   const jump = beginReplayJump(
     owner,
     engineReads().readTelemetry(),
@@ -163,6 +258,9 @@ export async function holdLapPressSlot(
   } catch (error) {
     if (error instanceof FastestLapPressCancelled) {
       lapPressLogger().debug(`${label}: ${error.message}; cursor left where that command put it`);
+    } else if (error instanceof LapWalkInterrupted) {
+      // The walk catches its own interrupt and puts the replay back; one that reaches here came after the walk.
+      lapPressLogger().debug(`${label}: ${error.message}`);
     } else {
       lapPressLogger().error(`${label}: ${noun} failed: ${error instanceof Error ? error.message : String(error)}`);
     }

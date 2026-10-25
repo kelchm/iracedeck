@@ -266,23 +266,27 @@ function jumpToGreenFromPoleCar(
 /**
  * The last resort of a Jump to Race Start press: search the replay for the
  * start of the pole car's lap 1 with the walk Jump to Fastest Lap uses, then
- * one waited jump back by the rest of the run-up.
+ * one waited jump to the green's approach: the walk makes no run-up jump of
+ * its own (`jumpToRunUp: false`), so this is the one jump after its last
+ * probe, as the way back is for a search that came to nothing.
  *
  * iRacing's lap search follows the camera, so the camera goes onto the pole
  * car for the search and back onto the car that was on screen at the press
  * once the cursor has landed — the green belongs to the whole field, and the
- * user had chosen what to watch. It goes back too when the search gives up
- * or the last jump stops short, but not when another replay command
- * cancelled the press: that command's own effect stands.
+ * user had chosen what to watch. It goes back too when the search gives up,
+ * when a camera key interrupts it (#1428 / #1435: the replay is put back and
+ * the key's own switch follows) or when the last jump stops short, but not
+ * when another replay command cancelled the press: that command's own effect
+ * stands.
  *
- * A search that could not verify its landing still anchors the jump when
- * the landing is near the end of the lap before lap 1
- * (`acceptsGreenFallbackLanding`): the anchor of a five-second run-up need
- * not be the exact frame the lap record demands, and iRacing's Next Lap can
- * land a few frames short of what the walk verifies (#1432). Anything
- * further off is a search that came to nothing, and like one that gave up
- * on the way it ends with the replay back on the frame and at the speed the
- * press found it: the press leaves no trace but its log lines.
+ * A search that did not find the line still anchors the jump on where
+ * iRacing's lap search left the pole car, when that is near the end of the
+ * lap before lap 1 (`acceptsGreenFallbackLanding`): the anchor of a
+ * five-second run-up need not be the exact frame the lap record demands
+ * (#1432). Anything further off is a search that came to nothing, and like
+ * one that gave up on the way it ends with the replay back on the frame and
+ * at the speed the press found it: the press leaves no trace but its log
+ * lines.
  */
 async function searchGreenFromPoleCar(
   origin: string,
@@ -294,20 +298,28 @@ async function searchGreenFromPoleCar(
 
   await holdLapPressSlot(origin, press, async (jump) => {
     const camera = engineEnv().camera();
-    const borrowed = car.viewedCarIdx !== car.carIdx;
     const viewedCarNum = car.viewedCarIdx >= 0 && car.viewedCarIdx !== 255 ? carNumberRawByIdx(car.viewedCarIdx) : null;
+    /** Whether the press moved the camera onto the pole car, and so owes the move back. */
+    let borrowed = false;
 
-    if (borrowed) {
+    if (car.viewedCarIdx !== car.carIdx) {
       // Not into a jump still under way, which would swallow the switch and
       // leave the search following the car on screen (#1430).
       await waitToSwitchCamera(jump.claim, RACE_START_LOG_LABEL);
 
-      if (!camera.switchNum(car.carNum, 0, 0)) {
-        // If the SDK refused, abort rather than search for the wrong driver's lap.
-        logger.warn("Jump to race start: camera switch failed, aborting");
-        logger.debug(`Failed switchNum: carNum=${car.carNum}, carIdx=${car.carIdx}`);
+      // A camera key that interrupted the press meanwhile (#1428 / #1435)
+      // wants another car: nothing is borrowed, and the walk stops at its
+      // first checkpoint.
+      if (jump.claim.interruptedBy === null) {
+        if (!camera.switchNum(car.carNum, 0, 0)) {
+          // If the SDK refused, abort rather than search for the wrong driver's lap.
+          logger.warn("Jump to race start: camera switch failed, aborting");
+          logger.debug(`Failed switchNum: carNum=${car.carNum}, carIdx=${car.carIdx}`);
 
-        return;
+          return;
+        }
+
+        borrowed = true;
       }
     }
 
@@ -349,9 +361,14 @@ async function searchGreenFromPoleCar(
       instance: target.from === "cursor" ? "cursor" : "latest",
       identity: car.identity,
       label: RACE_START_LOG_LABEL,
+      // The press's next jump is its own, to the green's approach or back to
+      // where it was made: the walk's run-up jump would be a wasted seek.
+      jumpToRunUp: false,
     });
 
-    // The search gave up, logged why and put the replay back.
+    // The search gave up, logged why and put the replay back; or a camera key
+    // interrupted it (#1428 / #1435), and the replay is put back the same
+    // way before that key's own switch goes out.
     if (landing === null) {
       await restoreCameraWhenSettled();
 
@@ -361,7 +378,7 @@ async function searchGreenFromPoleCar(
     if (!acceptsGreenFallbackLanding(landing)) {
       logger.warn("Jump to race start: the search did not reach the start of the pole car's lap 1");
       logger.debug(
-        `Landed frame ${landing.landedFrame}, dist on the lap before lap 1: ${landing.priorLapDist ?? "n/a"}`,
+        `The walk's unverified lap start is frame ${landing.lapStartFrame}, dist on the lap before lap 1: ${landing.priorLapDist ?? "n/a"}`,
       );
       // The camera only once the way back has landed: sent during the seek
       // it would cut it short (#1275), and iRacing would drop it (#1430).
